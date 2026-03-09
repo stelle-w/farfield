@@ -79,9 +79,35 @@ export const UserMessageImageContentPartSchema = z
   })
   .passthrough();
 
+export const UserMessageLocalImageContentPartSchema = z
+  .object({
+    type: z.literal("localImage"),
+    path: z.string()
+  })
+  .passthrough();
+
+export const UserMessageSkillContentPartSchema = z
+  .object({
+    type: z.literal("skill"),
+    name: z.string(),
+    path: z.string()
+  })
+  .passthrough();
+
+export const UserMessageMentionContentPartSchema = z
+  .object({
+    type: z.literal("mention"),
+    name: z.string(),
+    path: z.string()
+  })
+  .passthrough();
+
 export const UserMessagePartSchema = z.union([
   UserMessageContentPartSchema,
-  UserMessageImageContentPartSchema
+  UserMessageImageContentPartSchema,
+  UserMessageLocalImageContentPartSchema,
+  UserMessageSkillContentPartSchema,
+  UserMessageMentionContentPartSchema
 ]);
 
 export const UserMessageItemSchema = z
@@ -149,7 +175,7 @@ export const TodoListItemSchema = z
   .object({
     id: NonEmptyStringSchema,
     type: z.literal("todo-list"),
-    explanation: z.string().optional(),
+    explanation: z.union([z.string(), z.null()]).optional(),
     plan: z.array(TodoListPlanStepSchema)
   })
   .passthrough();
@@ -190,7 +216,7 @@ export const CommandActionSchema = z
     command: z.string().optional(),
     name: z.string().optional(),
     path: z.union([z.string(), z.null()]).optional(),
-    query: z.string().optional()
+    query: z.union([z.string(), z.null()]).optional()
   })
   .passthrough();
 
@@ -200,7 +226,7 @@ export const CommandExecutionItemSchema = z
     id: NonEmptyStringSchema,
     command: z.string(),
     cwd: z.string().optional(),
-    processId: z.string().optional(),
+    processId: z.union([z.string(), z.null()]).optional(),
     status: NonEmptyStringSchema,
     commandActions: z.array(CommandActionSchema).optional(),
     aggregatedOutput: z.union([z.string(), z.null()]).optional(),
@@ -241,20 +267,88 @@ export const ContextCompactionItemSchema = z
   })
   .passthrough();
 
-export const WebSearchActionSchema = z
+export const WebSearchSearchActionSchema = z
   .object({
-    type: NonEmptyStringSchema,
-    query: z.string().optional(),
-    queries: z.array(z.string()).optional()
+    type: z.literal("search"),
+    query: z.union([z.string(), z.null()]).optional(),
+    queries: z.union([z.array(z.string()), z.null()]).optional()
   })
   .passthrough();
+
+export const WebSearchOpenPageActionSchema = z
+  .object({
+    type: z.literal("openPage"),
+    url: z.union([z.string(), z.null()]).optional()
+  })
+  .passthrough();
+
+export const WebSearchFindInPageActionSchema = z
+  .object({
+    type: z.literal("findInPage"),
+    url: z.union([z.string(), z.null()]).optional(),
+    pattern: z.union([z.string(), z.null()]).optional()
+  })
+  .passthrough();
+
+export const WebSearchOtherActionSchema = z
+  .object({
+    type: z.literal("other")
+  })
+  .passthrough();
+
+export const WebSearchActionSchema = z.union([
+  WebSearchSearchActionSchema,
+  WebSearchOpenPageActionSchema,
+  WebSearchFindInPageActionSchema,
+  WebSearchOtherActionSchema
+]);
 
 export const WebSearchItemSchema = z
   .object({
     type: z.literal("webSearch"),
     id: NonEmptyStringSchema,
     query: z.string(),
-    action: WebSearchActionSchema
+    action: z.union([WebSearchActionSchema, z.null()]).optional()
+  })
+  .passthrough();
+
+export const DynamicToolCallOutputTextContentItemSchema = z
+  .object({
+    type: z.literal("inputText"),
+    text: z.string()
+  })
+  .passthrough();
+
+export const DynamicToolCallOutputImageContentItemSchema = z
+  .object({
+    type: z.literal("inputImage"),
+    imageUrl: z.string()
+  })
+  .passthrough();
+
+export const DynamicToolCallOutputContentItemSchema = z.union([
+  DynamicToolCallOutputTextContentItemSchema,
+  DynamicToolCallOutputImageContentItemSchema
+]);
+
+export const DynamicToolCallStatusSchema = z.enum([
+  "inProgress",
+  "completed",
+  "failed"
+]);
+
+export const DynamicToolCallItemSchema = z
+  .object({
+    type: z.literal("dynamicToolCall"),
+    id: NonEmptyStringSchema,
+    tool: z.string(),
+    arguments: JsonValueSchema,
+    status: DynamicToolCallStatusSchema,
+    contentItems: z
+      .union([z.array(DynamicToolCallOutputContentItemSchema), z.null()])
+      .optional(),
+    success: z.union([z.boolean(), z.null()]).optional(),
+    durationMs: z.union([NonNegativeIntSchema, z.null()]).optional()
   })
   .passthrough();
 
@@ -391,6 +485,7 @@ export const TurnItemSchema = z.discriminatedUnion("type", [
   ContextCompactionItemSchema,
   WebSearchItemSchema,
   McpToolCallItemSchema,
+  DynamicToolCallItemSchema,
   CollabAgentToolCallItemSchema,
   ImageViewItemSchema,
   EnteredReviewModeItemSchema,
@@ -457,6 +552,23 @@ export const ThreadTurnSchema = z
   })
   .passthrough();
 
+export const ThreadActiveFlagSchema = z.enum([
+  "waitingOnApproval",
+  "waitingOnUserInput"
+]);
+
+export const ThreadStatusSchema = z.union([
+  z.object({ type: z.literal("notLoaded") }).passthrough(),
+  z.object({ type: z.literal("idle") }).passthrough(),
+  z.object({ type: z.literal("systemError") }).passthrough(),
+  z
+    .object({
+      type: z.literal("active"),
+      activeFlags: z.array(ThreadActiveFlagSchema)
+    })
+    .passthrough()
+]);
+
 export const ThreadConversationStateSchema = z
   .object({
     id: NonEmptyStringSchema,
@@ -475,6 +587,7 @@ export const ThreadConversationStateSchema = z
     gitInfo: z.union([JsonValueSchema, z.null()]).optional(),
     resumeState: z.string().optional(),
     latestTokenUsageInfo: JsonValueSchema.optional(),
+    status: ThreadStatusSchema.optional(),
     source: z.string().optional()
   })
   .passthrough();

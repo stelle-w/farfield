@@ -1,28 +1,35 @@
 import { z } from "zod";
-import { ProtocolValidationError } from "@farfield/protocol";
+import {
+  JsonValueSchema,
+  ProtocolValidationError,
+  RequestIdSchema
+} from "@farfield/protocol";
 
 export const JsonRpcRequestSchema = z
   .object({
-    jsonrpc: z.literal("2.0"),
-    id: z.number().int().nonnegative(),
+    jsonrpc: z.literal("2.0").optional(),
+    id: RequestIdSchema,
     method: z.string().min(1),
-    params: z.unknown().optional()
+    params: JsonValueSchema.optional()
+  })
+  .passthrough();
+
+export type JsonRpcRequest = z.infer<typeof JsonRpcRequestSchema>;
+
+export const JsonRpcErrorSchema = z
+  .object({
+    code: z.number().int(),
+    message: z.string(),
+    data: JsonValueSchema.optional()
   })
   .passthrough();
 
 export const JsonRpcResponseSchema = z
   .object({
     jsonrpc: z.literal("2.0").optional(),
-    id: z.number().int().nonnegative(),
-    result: z.unknown().optional(),
-    error: z
-      .object({
-        code: z.number().int(),
-        message: z.string(),
-        data: z.unknown().optional()
-      })
-      .passthrough()
-      .optional()
+    id: RequestIdSchema,
+    result: JsonValueSchema.optional(),
+    error: JsonRpcErrorSchema.optional()
   })
   .passthrough()
   .superRefine((value, context) => {
@@ -48,7 +55,7 @@ export const JsonRpcNotificationSchema = z
   .object({
     jsonrpc: z.literal("2.0").optional(),
     method: z.string().min(1),
-    params: z.unknown().optional()
+    params: JsonValueSchema.optional()
   })
   .passthrough();
 
@@ -56,6 +63,7 @@ export type JsonRpcNotification = z.infer<typeof JsonRpcNotificationSchema>;
 
 export type JsonRpcIncomingMessage =
   | { kind: "response"; value: JsonRpcResponse }
+  | { kind: "request"; value: JsonRpcRequest }
   | { kind: "notification"; value: JsonRpcNotification };
 
 export function parseJsonRpcIncomingMessage(value: unknown): JsonRpcIncomingMessage {
@@ -64,6 +72,14 @@ export function parseJsonRpcIncomingMessage(value: unknown): JsonRpcIncomingMess
     return {
       kind: "response",
       value: parsedResponse.data
+    };
+  }
+
+  const parsedRequest = JsonRpcRequestSchema.safeParse(value);
+  if (parsedRequest.success) {
+    return {
+      kind: "request",
+      value: parsedRequest.data
     };
   }
 
@@ -77,6 +93,7 @@ export function parseJsonRpcIncomingMessage(value: unknown): JsonRpcIncomingMess
 
   const combinedError = new z.ZodError([
     ...parsedResponse.error.issues,
+    ...parsedRequest.error.issues,
     ...parsedNotification.error.issues
   ]);
   throw ProtocolValidationError.fromZod("JsonRpcIncomingMessage", combinedError);

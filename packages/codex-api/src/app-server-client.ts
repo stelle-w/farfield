@@ -24,6 +24,8 @@ import { z } from "zod";
 import {
   AppServerTransport,
   ChildProcessAppServerTransport,
+  type AppServerNotificationListener,
+  type AppServerRequestListener,
   type ChildProcessAppServerTransportOptions
 } from "./app-server-transport.js";
 
@@ -95,6 +97,25 @@ const AppServerTurnSteerRequestSchema = z
   })
   .passthrough();
 
+const AppServerTurnStartRequestSchema = TurnStartParamsSchema.superRefine(
+  (value, ctx) => {
+    if (!value.collaborationMode) {
+      return;
+    }
+
+    const model = value.collaborationMode.settings.model;
+    if (typeof model === "string" && model.trim().length > 0) {
+      return;
+    }
+
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "collaborationMode.settings.model is required",
+      path: ["collaborationMode", "settings", "model"]
+    });
+  }
+);
+
 const AppServerLoadedThreadListResponseSchema = z
   .object({
     data: z.array(z.string().min(1)),
@@ -118,6 +139,16 @@ export class AppServerClient {
 
   public async close(): Promise<void> {
     await this.transport.close();
+  }
+
+  public onServerNotification(
+    listener: AppServerNotificationListener
+  ): () => void {
+    return this.transport.onServerNotification(listener);
+  }
+
+  public onServerRequest(listener: AppServerRequestListener): () => void {
+    return this.transport.onServerRequest(listener);
   }
 
   public async listThreads(options: ListThreadsOptions): Promise<AppServerListThreadsResponse> {
@@ -231,7 +262,7 @@ export class AppServerClient {
   }
 
   public async sendUserMessage(threadId: string, text: string): Promise<void> {
-    const request = TurnStartParamsSchema.parse({
+    const request = AppServerTurnStartRequestSchema.parse({
       threadId,
       input: [
         {
@@ -245,7 +276,7 @@ export class AppServerClient {
   }
 
   public async startTurn(params: TurnStartParams): Promise<void> {
-    const request = TurnStartParamsSchema.parse(params);
+    const request = AppServerTurnStartRequestSchema.parse(params);
     await this.transport.request("turn/start", request);
   }
 

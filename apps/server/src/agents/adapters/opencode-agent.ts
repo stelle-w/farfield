@@ -24,6 +24,7 @@ import type {
   AgentReadThreadInput,
   AgentReadThreadResult,
   AgentSendMessageInput,
+  AgentSetCollaborationModeInput,
 } from "../types.js";
 
 export interface OpenCodeAgentOptions {
@@ -329,16 +330,9 @@ export class OpenCodeAgentAdapter implements AgentAdapter {
     return AppServerCollaborationModeListResponseSchema.parse({ data });
   }
 
-  public async setCollaborationMode(input: {
-    threadId: string;
-    collaborationMode: {
-      mode: string;
-      settings: {
-        model?: string | null;
-        reasoning_effort?: string | null;
-      };
-    };
-  }): Promise<{ ownerClientId: string }> {
+  public async setCollaborationMode(
+    input: AgentSetCollaborationModeInput,
+  ): Promise<{ ownerClientId: string }> {
     this.ensureConnected();
     this.threadModeById.set(input.threadId, {
       mode: input.collaborationMode.mode,

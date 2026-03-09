@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { JsonValueSchema } from "./common.js";
 import { ProtocolValidationError } from "./errors.js";
 import { CollaborationModeSchema, ThreadConversationStateSchema } from "./thread.js";
 import {
@@ -14,6 +15,7 @@ import {
   ExperimentalServerRequestSchema as GeneratedExperimentalServerRequestSchema,
   GetAccountRateLimitsResponseSchema as GeneratedGetAccountRateLimitsResponseSchema,
   ModelListResponseSchema as GeneratedModelListResponseSchema,
+  RequestIdSchema,
   StableServerRequestSchema as GeneratedStableServerRequestSchema,
   ThreadListResponseSchema as GeneratedThreadListResponseSchema,
   ThreadReadResponseSchema as GeneratedThreadReadResponseSchema,
@@ -32,6 +34,9 @@ const AppServerServerRequestBaseSchema = z.union([
   GeneratedStableServerRequestSchema,
   GeneratedExperimentalServerRequestSchema
 ]);
+const AppServerServerNotificationMethodSchema = z.enum(
+  APP_SERVER_SERVER_NOTIFICATION_METHODS
+);
 
 const ThreadTitleSchema = z.union([z.string(), z.null()]).optional();
 const ThreadIsGeneratingSchema = z.boolean().optional();
@@ -93,6 +98,7 @@ export const AppServerCollaborationModeListResponseSchema =
   AppServerCollaborationModeListResponseBaseSchema;
 
 export const AppServerStartThreadRequestSchema = AppServerStartThreadRequestBaseSchema;
+export { RequestIdSchema };
 
 export const AppServerStartThreadResponseSchema = z
   .object({
@@ -107,6 +113,12 @@ export const AppServerStartThreadResponseSchema = z
   .passthrough();
 
 export const AppServerServerRequestSchema = AppServerServerRequestBaseSchema;
+export const AppServerServerNotificationSchema = z
+  .object({
+    method: AppServerServerNotificationMethodSchema,
+    params: JsonValueSchema.optional()
+  })
+  .passthrough();
 
 export const AppServerGetAccountRateLimitsResponseSchema =
   AppServerGetAccountRateLimitsResponseBaseSchema;
@@ -135,6 +147,10 @@ export type AppServerStartThreadResponse = z.infer<typeof AppServerStartThreadRe
 export type AppServerLoadedThreadListResponse = z.infer<typeof AppServerLoadedThreadListResponseSchema>;
 export type AppServerGetAccountRateLimitsResponse = z.infer<
   typeof AppServerGetAccountRateLimitsResponseSchema
+>;
+export type AppServerServerRequest = z.infer<typeof AppServerServerRequestSchema>;
+export type AppServerServerNotification = z.infer<
+  typeof AppServerServerNotificationSchema
 >;
 export {
   APP_SERVER_CLIENT_REQUEST_METHODS,

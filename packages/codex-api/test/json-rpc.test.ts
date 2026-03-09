@@ -2,6 +2,16 @@ import { describe, expect, it } from "vitest";
 import { parseJsonRpcIncomingMessage, parseJsonRpcResponse } from "../src/json-rpc.js";
 
 describe("parseJsonRpcResponse", () => {
+  it("accepts string ids", () => {
+    const parsed = parseJsonRpcResponse({
+      id: "req-1",
+      result: { ok: true }
+    });
+
+    expect(parsed.id).toBe("req-1");
+    expect(parsed.result).toEqual({ ok: true });
+  });
+
   it("accepts response without jsonrpc", () => {
     const parsed = parseJsonRpcResponse({
       id: 1,
@@ -47,6 +57,22 @@ describe("parseJsonRpcIncomingMessage", () => {
     if (parsed.kind === "notification") {
       expect(parsed.value.method).toBe("thread/updated");
       expect(parsed.value.params).toEqual({ threadId: "thread-1" });
+    }
+  });
+
+  it("accepts request payload", () => {
+    const parsed = parseJsonRpcIncomingMessage({
+      id: "request-1",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: "thread-1"
+      }
+    });
+
+    expect(parsed.kind).toBe("request");
+    if (parsed.kind === "request") {
+      expect(parsed.value.id).toBe("request-1");
+      expect(parsed.value.method).toBe("item/tool/requestUserInput");
     }
   });
 

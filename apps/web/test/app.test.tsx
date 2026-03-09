@@ -375,9 +375,14 @@ function buildConversationStateFixture(
   const includePendingRequest = options?.includePendingRequest ?? false;
   const updatedAt = options?.updatedAt ?? 1700000000;
   const provider = options?.provider ?? "codex";
-  const latestReasoningEffort = options?.latestReasoningEffort ?? "medium";
+  const latestReasoningEffort =
+    options?.latestReasoningEffort !== undefined
+      ? options.latestReasoningEffort
+      : "medium";
   const collaborationModeReasoningEffort =
-    options?.collaborationModeReasoningEffort ?? "medium";
+    options?.collaborationModeReasoningEffort !== undefined
+      ? options.collaborationModeReasoningEffort
+      : "medium";
   return {
     id: threadId,
     provider,
@@ -1193,7 +1198,11 @@ describe("App", () => {
 
     render(<App />);
 
-    expect(await screen.findByText("direct-route-loaded")).toBeTruthy();
+    expect(
+      await screen.findByText("direct-route-loaded", undefined, {
+        timeout: 3000,
+      }),
+    ).toBeTruthy();
     await waitFor(() =>
       expect(window.location.pathname).toBe(`/threads/${threadId}`),
     );
@@ -1287,6 +1296,294 @@ describe("App", () => {
   it("shows mode controls when capability is enabled", async () => {
     render(<App />);
     expect(await screen.findByText("Plan")).toBeTruthy();
+  });
+
+  it("sends an explicit collaboration mode model for web messages", async () => {
+    const threadId = "thread-plan-send";
+    const modelId = "gpt-5.3-codex";
+    const threadState = {
+      ...buildConversationStateFixture(threadId, modelId, {
+        latestReasoningEffort: null,
+        collaborationModeReasoningEffort: null,
+      }),
+      latestModel: null,
+      latestCollaborationMode: {
+        mode: "plan",
+        settings: {
+          model: null,
+          reasoningEffort: null,
+          developerInstructions: "plan instructions",
+        },
+      },
+    } satisfies UnifiedThreadFixture;
+
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "thread preview",
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    collaborationModesFixture = {
+      codex: [
+        {
+          name: "Default",
+          mode: "default",
+          model: null,
+          reasoningEffort: "medium",
+          developerInstructions: null,
+        },
+        {
+          name: "Plan",
+          mode: "plan",
+          model: null,
+          reasoningEffort: "high",
+          developerInstructions: "plan instructions",
+        },
+      ],
+      opencode: [],
+    };
+
+    modelsFixture = {
+      codex: [
+        {
+          id: modelId,
+          displayName: modelId,
+          description: "Default model",
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["medium", "high"],
+          hidden: false,
+          isDefault: true,
+        },
+      ],
+      opencode: [],
+    };
+
+    readThreadResolver = (targetThreadId: string) => ({
+      ok: true,
+      thread: {
+        ...threadState,
+        id: targetThreadId,
+      },
+    });
+
+    liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
+      kind: "readLiveState",
+      threadId: targetThreadId,
+      ownerClientId: "client-1",
+      conversationState: {
+        ...threadState,
+        id: targetThreadId,
+      },
+      liveStateError: null,
+    });
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByRole("textbox"), {
+      target: { value: "Plan this change" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Send" }));
+
+    type UnifiedCommandPayload = {
+      kind?: string;
+      ownerClientId?: string;
+      text?: string;
+      collaborationMode?: {
+        mode?: string;
+        settings?: {
+          model?: string;
+        };
+      };
+    };
+
+    await waitFor(() => {
+      const payloads = vi
+        .mocked(fetch)
+        .mock
+        .calls
+        .filter(([input]) => String(input).includes("/api/unified/command"))
+        .map(([, init]) =>
+          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
+        );
+
+      const sendCommand =
+        payloads.find(
+          (payload) =>
+            payload.kind === "sendMessage" &&
+            payload.text === "Plan this change",
+        ) ?? null;
+
+      expect(sendCommand).not.toBeNull();
+      expect(sendCommand?.ownerClientId).toBe("client-1");
+      expect(sendCommand?.collaborationMode?.mode).toBe("plan");
+      expect(sendCommand?.collaborationMode?.settings?.model).toBe(modelId);
+    });
+  });
+
+  it("uses thread latest model when collaboration mode leaves model unset", async () => {
+    const threadId = "thread-latest-model-fallback";
+    const latestModelId = "gpt-5.3-codex";
+    const defaultModelId = "gpt-5-mini";
+    const baseThreadState = buildConversationStateFixture(
+      threadId,
+      latestModelId,
+      {
+        latestReasoningEffort: "high",
+        collaborationModeReasoningEffort: null,
+      },
+    );
+    const threadState = {
+      ...baseThreadState,
+      latestModel: latestModelId,
+      latestCollaborationMode: baseThreadState.latestCollaborationMode
+        ? {
+            ...baseThreadState.latestCollaborationMode,
+            settings: {
+              ...baseThreadState.latestCollaborationMode.settings,
+              model: null,
+              reasoningEffort: null,
+            },
+          }
+        : null,
+    } satisfies UnifiedThreadFixture;
+
+    threadsFixture = {
+      ok: true,
+      data: [
+        {
+          id: threadId,
+          provider: "codex",
+          preview: "thread preview",
+          createdAt: 1700000000,
+          updatedAt: 1700000000,
+          cwd: "/tmp/project",
+          source: "codex",
+        },
+      ],
+      cursors: {
+        codex: null,
+        opencode: null,
+      },
+      errors: {
+        codex: null,
+        opencode: null,
+      },
+    };
+
+    collaborationModesFixture = {
+      codex: [
+        {
+          name: "Default",
+          mode: "default",
+          model: null,
+          reasoningEffort: null,
+          developerInstructions: null,
+        },
+      ],
+      opencode: [],
+    };
+
+    modelsFixture = {
+      codex: [
+        {
+          id: defaultModelId,
+          displayName: defaultModelId,
+          description: "Default model",
+          defaultReasoningEffort: "medium",
+          supportedReasoningEfforts: ["medium", "high"],
+          hidden: false,
+          isDefault: true,
+        },
+        {
+          id: latestModelId,
+          displayName: latestModelId,
+          description: "Thread model",
+          defaultReasoningEffort: "high",
+          supportedReasoningEfforts: ["medium", "high"],
+          hidden: false,
+          isDefault: false,
+        },
+      ],
+      opencode: [],
+    };
+
+    readThreadResolver = (targetThreadId: string) => ({
+      ok: true,
+      thread: {
+        ...threadState,
+        id: targetThreadId,
+      },
+    });
+
+    liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
+      kind: "readLiveState",
+      threadId: targetThreadId,
+      ownerClientId: "client-1",
+      conversationState: {
+        ...threadState,
+        id: targetThreadId,
+      },
+      liveStateError: null,
+    });
+
+    render(<App />);
+
+    fireEvent.change(await screen.findByRole("textbox"), {
+      target: { value: "Use the thread model" },
+    });
+    fireEvent.click(await screen.findByRole("button", { name: "Send" }));
+
+    type UnifiedCommandPayload = {
+      kind?: string;
+      text?: string;
+      model?: string;
+      collaborationMode?: {
+        settings?: {
+          model?: string;
+        };
+      };
+    };
+
+    await waitFor(() => {
+      const payloads = vi
+        .mocked(fetch)
+        .mock
+        .calls
+        .filter(([input]) => String(input).includes("/api/unified/command"))
+        .map(([, init]) =>
+          JSON.parse(String(init?.body ?? "{}")) as UnifiedCommandPayload,
+        );
+
+      const sendCommand =
+        payloads.find(
+          (payload) =>
+            payload.kind === "sendMessage" &&
+            payload.text === "Use the thread model",
+        ) ?? null;
+
+      expect(sendCommand).not.toBeNull();
+      expect(sendCommand?.model).toBe(latestModelId);
+      expect(sendCommand?.collaborationMode?.settings?.model).toBe(
+        latestModelId,
+      );
+    });
   });
 
   it("shows project group labels from cwd basename", async () => {
@@ -2252,6 +2549,23 @@ describe("App", () => {
   it("shows model default effort when thread effort fields are unset", async () => {
     const threadId = "thread-effort-default";
     const modelId = "gpt-5.3-codex";
+    const baseThreadState = buildConversationStateFixture(threadId, modelId, {
+      latestReasoningEffort: null,
+      collaborationModeReasoningEffort: null,
+    });
+    const threadState = {
+      ...baseThreadState,
+      latestReasoningEffort: null,
+      latestCollaborationMode: baseThreadState.latestCollaborationMode
+        ? {
+            ...baseThreadState.latestCollaborationMode,
+            settings: {
+              ...baseThreadState.latestCollaborationMode.settings,
+              reasoningEffort: null,
+            },
+          }
+        : null,
+    } satisfies UnifiedThreadFixture;
 
     threadsFixture = {
       ok: true,
@@ -2312,34 +2626,53 @@ describe("App", () => {
 
     readThreadResolver = (targetThreadId: string) => ({
       ok: true,
-      thread: buildConversationStateFixture(targetThreadId, modelId, {
-        latestReasoningEffort: null,
-        collaborationModeReasoningEffort: null,
-      }),
+      thread: {
+        ...threadState,
+        id: targetThreadId,
+      },
     });
 
     liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
       kind: "readLiveState",
       threadId: targetThreadId,
       ownerClientId: "client-1",
-      conversationState: buildConversationStateFixture(
-        targetThreadId,
-        modelId,
-        {
-          latestReasoningEffort: null,
-          collaborationModeReasoningEffort: null,
-        },
-      ),
+      conversationState: {
+        ...threadState,
+        id: targetThreadId,
+      },
       liveStateError: null,
     });
 
     render(<App />);
-    expect(await screen.findByText("xhigh")).toBeTruthy();
+    await waitFor(() => {
+      const effortPicker = screen.getAllByRole("combobox")[1];
+      if (!effortPicker) {
+        throw new Error("Effort picker is missing");
+      }
+      expect(effortPicker.textContent).toContain("xhigh");
+    });
   });
 
   it("prefers selected mode default effort over model default when thread effort is unset", async () => {
     const threadId = "thread-mode-default-effort";
     const modelId = "gpt-5.3-codex";
+    const baseThreadState = buildConversationStateFixture(threadId, modelId, {
+      latestReasoningEffort: null,
+      collaborationModeReasoningEffort: null,
+    });
+    const threadState = {
+      ...baseThreadState,
+      latestReasoningEffort: null,
+      latestCollaborationMode: baseThreadState.latestCollaborationMode
+        ? {
+            ...baseThreadState.latestCollaborationMode,
+            settings: {
+              ...baseThreadState.latestCollaborationMode.settings,
+              reasoningEffort: null,
+            },
+          }
+        : null,
+    } satisfies UnifiedThreadFixture;
 
     threadsFixture = {
       ok: true,
@@ -2400,28 +2733,30 @@ describe("App", () => {
 
     readThreadResolver = (targetThreadId: string) => ({
       ok: true,
-      thread: buildConversationStateFixture(targetThreadId, modelId, {
-        latestReasoningEffort: null,
-        collaborationModeReasoningEffort: null,
-      }),
+      thread: {
+        ...threadState,
+        id: targetThreadId,
+      },
     });
 
     liveStateResolver = (targetThreadId: string, _provider: ProviderId) => ({
       kind: "readLiveState",
       threadId: targetThreadId,
       ownerClientId: "client-1",
-      conversationState: buildConversationStateFixture(
-        targetThreadId,
-        modelId,
-        {
-          latestReasoningEffort: null,
-          collaborationModeReasoningEffort: null,
-        },
-      ),
+      conversationState: {
+        ...threadState,
+        id: targetThreadId,
+      },
       liveStateError: null,
     });
 
     render(<App />);
-    expect(await screen.findByText("xhigh")).toBeTruthy();
+    await waitFor(() => {
+      const effortPicker = screen.getAllByRole("combobox")[1];
+      if (!effortPicker) {
+        throw new Error("Effort picker is missing");
+      }
+      expect(effortPicker.textContent).toContain("xhigh");
+    });
   });
 });

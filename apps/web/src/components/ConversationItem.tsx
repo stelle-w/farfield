@@ -25,6 +25,7 @@ const TOOL_BLOCK_TYPES: readonly UnifiedItem["type"][] = [
   "fileChange",
   "webSearch",
   "mcpToolCall",
+  "dynamicToolCall",
   "collabAgentToolCall",
   "remoteTaskCreated",
   "forkedFromConversation",
@@ -48,8 +49,23 @@ function toolBlockSpacingClass(
 
 function readTextContent(content: UserMessageLikeItem["content"]): string {
   return content
-    .map((part) => (part.type === "text" ? part.text : ""))
-    .filter((text) => text.length > 0)
+    .map((part) => {
+      switch (part.type) {
+        case "text":
+          return part.text;
+        case "image":
+          return "[Image attached]";
+        case "localImage":
+          return `[Local image] ${part.path}`;
+        case "skill":
+          return `[Skill] ${part.name}`;
+        case "mention":
+          return `[Mention] ${part.name}`;
+        default:
+          return "";
+      }
+    })
+    .filter((text) => text.trim().length > 0)
     .join("\n");
 }
 
@@ -272,6 +288,40 @@ const ITEM_RENDERERS = {
     );
   },
 
+  dynamicToolCall: ({ item, toolSpacing }) => {
+    const argumentsText = JSON.stringify(item.arguments);
+    return (
+      <div
+        className={`${toolSpacing} rounded-lg border border-border bg-muted/20 px-3 py-2`}
+      >
+        <div className="text-[10px] text-muted-foreground font-mono mb-1 uppercase tracking-wider">
+          Tool call
+        </div>
+        <div className="text-xs text-foreground/90 whitespace-pre-wrap break-words">
+          {item.tool} ({item.status})
+        </div>
+        {item.success !== undefined && item.success !== null && (
+          <div className="mt-1 text-[11px] text-muted-foreground font-mono">
+            success: {item.success ? "yes" : "no"}
+          </div>
+        )}
+        {item.durationMs != null && (
+          <div className="mt-1 text-[11px] text-muted-foreground font-mono">
+            {item.durationMs}ms
+          </div>
+        )}
+        {item.contentItems && item.contentItems.length > 0 && (
+          <div className="mt-2 text-xs text-muted-foreground">
+            Output parts: {item.contentItems.length}
+          </div>
+        )}
+        <div className="mt-2 text-[11px] text-muted-foreground font-mono whitespace-pre-wrap break-all">
+          {argumentsText}
+        </div>
+      </div>
+    );
+  },
+
   collabAgentToolCall: ({ item, toolSpacing }) => (
     <div
       className={`${toolSpacing} rounded-lg border border-border bg-muted/20 px-3 py-2`}
@@ -394,6 +444,8 @@ function renderItem(
       return ITEM_RENDERERS.webSearch({ item, ...context });
     case "mcpToolCall":
       return ITEM_RENDERERS.mcpToolCall({ item, ...context });
+    case "dynamicToolCall":
+      return ITEM_RENDERERS.dynamicToolCall({ item, ...context });
     case "collabAgentToolCall":
       return ITEM_RENDERERS.collabAgentToolCall({ item, ...context });
     case "imageView":

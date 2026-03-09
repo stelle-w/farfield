@@ -69,6 +69,10 @@ export class DesktopIpcClient {
     return this.socket !== null;
   }
 
+  public getClientId(): string | null {
+    return this.clientId;
+  }
+
   public async connect(): Promise<void> {
     if (this.socket) {
       throw new DesktopIpcError("IPC client is already connected");

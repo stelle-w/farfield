@@ -109,7 +109,36 @@ const UnifiedInputImagePartSchema = z
   })
   .strict();
 
-export const UnifiedInputPartSchema = z.union([UnifiedInputTextPartSchema, UnifiedInputImagePartSchema]);
+const UnifiedInputLocalImagePartSchema = z
+  .object({
+    type: z.literal("localImage"),
+    path: z.string()
+  })
+  .strict();
+
+const UnifiedInputSkillPartSchema = z
+  .object({
+    type: z.literal("skill"),
+    name: z.string(),
+    path: z.string()
+  })
+  .strict();
+
+const UnifiedInputMentionPartSchema = z
+  .object({
+    type: z.literal("mention"),
+    name: z.string(),
+    path: z.string()
+  })
+  .strict();
+
+export const UnifiedInputPartSchema = z.union([
+  UnifiedInputTextPartSchema,
+  UnifiedInputImagePartSchema,
+  UnifiedInputLocalImagePartSchema,
+  UnifiedInputSkillPartSchema,
+  UnifiedInputMentionPartSchema
+]);
 export type UnifiedInputPart = z.infer<typeof UnifiedInputPartSchema>;
 
 const UnifiedQuestionOptionSchema = z
@@ -544,7 +573,7 @@ const UnifiedTodoListItemSchema = z
   .object({
     id: NonEmptyStringSchema,
     type: z.literal("todoList"),
-    explanation: z.string().optional(),
+    explanation: NullableStringSchema.optional(),
     plan: z.array(
       z
         .object({
@@ -592,7 +621,7 @@ const UnifiedCommandActionSchema = z
     command: z.string().optional(),
     name: z.string().optional(),
     path: NullableStringSchema.optional(),
-    query: z.string().optional()
+    query: NullableStringSchema.optional()
   })
   .strict();
 
@@ -647,12 +676,35 @@ const UnifiedWebSearchItemSchema = z
     type: z.literal("webSearch"),
     query: z.string(),
     action: z
-      .object({
-        type: NonEmptyStringSchema,
-        query: z.string().optional(),
-        queries: z.array(z.string()).optional()
-      })
-      .strict()
+      .union([
+        z
+          .object({
+            type: z.literal("search"),
+            query: NullableStringSchema.optional(),
+            queries: z.union([z.array(z.string()), z.null()]).optional()
+          })
+          .strict(),
+        z
+          .object({
+            type: z.literal("openPage"),
+            url: NullableStringSchema.optional()
+          })
+          .strict(),
+        z
+          .object({
+            type: z.literal("findInPage"),
+            url: NullableStringSchema.optional(),
+            pattern: NullableStringSchema.optional()
+          })
+          .strict(),
+        z
+          .object({
+            type: z.literal("other")
+          })
+          .strict(),
+        z.null()
+      ])
+      .optional()
   })
   .strict();
 
@@ -685,6 +737,43 @@ const UnifiedMcpToolCallItemSchema = z
         z.null()
       ])
       .optional(),
+    durationMs: z.union([NonNegativeIntSchema, z.null()]).optional()
+  })
+  .strict();
+
+const UnifiedDynamicToolCallOutputTextItemSchema = z
+  .object({
+    type: z.literal("inputText"),
+    text: z.string()
+  })
+  .strict();
+
+const UnifiedDynamicToolCallOutputImageItemSchema = z
+  .object({
+    type: z.literal("inputImage"),
+    imageUrl: z.string()
+  })
+  .strict();
+
+const UnifiedDynamicToolCallItemSchema = z
+  .object({
+    id: NonEmptyStringSchema,
+    type: z.literal("dynamicToolCall"),
+    tool: z.string(),
+    arguments: JsonValueSchema,
+    status: z.enum(["inProgress", "completed", "failed"]),
+    contentItems: z
+      .union([
+        z.array(
+          z.union([
+            UnifiedDynamicToolCallOutputTextItemSchema,
+            UnifiedDynamicToolCallOutputImageItemSchema
+          ])
+        ),
+        z.null()
+      ])
+      .optional(),
+    success: z.union([z.boolean(), z.null()]).optional(),
     durationMs: z.union([NonNegativeIntSchema, z.null()]).optional()
   })
   .strict();
@@ -774,6 +863,7 @@ export const UnifiedItemSchema = z.discriminatedUnion("type", [
   UnifiedContextCompactionItemSchema,
   UnifiedWebSearchItemSchema,
   UnifiedMcpToolCallItemSchema,
+  UnifiedDynamicToolCallItemSchema,
   UnifiedCollabAgentToolCallItemSchema,
   UnifiedImageViewItemSchema,
   UnifiedEnteredReviewModeItemSchema,
@@ -801,6 +891,7 @@ export const UNIFIED_ITEM_KINDS = [
   "contextCompaction",
   "webSearch",
   "mcpToolCall",
+  "dynamicToolCall",
   "collabAgentToolCall",
   "imageView",
   "enteredReviewMode",
@@ -916,6 +1007,21 @@ const UnifiedCommandSendMessageSchema = z
     text: z.string().min(1),
     ownerClientId: z.string().optional(),
     cwd: z.string().optional(),
+    model: z.string().optional(),
+    effort: z.string().optional(),
+    collaborationMode: z
+      .object({
+        mode: NonEmptyStringSchema,
+        settings: z
+          .object({
+            model: NonEmptyStringSchema,
+            reasoningEffort: NullableStringSchema.optional(),
+            developerInstructions: NullableStringSchema.optional()
+          })
+          .strict()
+      })
+      .strict()
+      .optional(),
     isSteering: z.boolean().optional()
   })
   .strict();
@@ -955,7 +1061,7 @@ const UnifiedCommandSetCollaborationModeSchema = z
         mode: NonEmptyStringSchema,
         settings: z
           .object({
-            model: NullableStringSchema.optional(),
+            model: NonEmptyStringSchema,
             reasoningEffort: NullableStringSchema.optional(),
             developerInstructions: NullableStringSchema.optional()
           })
@@ -1253,6 +1359,25 @@ export const UNIFIED_EVENT_KINDS = [
 export const UnifiedRealtimeTabSchema = z.enum(["chat", "debug"]);
 export type UnifiedRealtimeTab = z.infer<typeof UnifiedRealtimeTabSchema>;
 
+const UnifiedRealtimeTimingMetricSchema = z
+  .object({
+    count: z.number().int().nonnegative(),
+    slowCount: z.number().int().nonnegative(),
+    lastMs: z.number().nonnegative(),
+    avgMs: z.number().nonnegative(),
+    maxMs: z.number().nonnegative(),
+  })
+  .strict();
+
+const UnifiedRealtimeServerTimingsSchema = z
+  .object({
+    realtimeCoreBuild: UnifiedRealtimeTimingMetricSchema,
+    realtimeThreadBuild: UnifiedRealtimeTimingMetricSchema,
+    codexThreadRefresh: UnifiedRealtimeTimingMetricSchema,
+    codexLiveStateRead: UnifiedRealtimeTimingMetricSchema,
+  })
+  .strict();
+
 const UnifiedRealtimeHealthStateSchema = z
   .object({
     appReady: z.boolean(),
@@ -1261,7 +1386,8 @@ const UnifiedRealtimeHealthStateSchema = z
     gitCommit: z.union([z.string(), z.null()]).optional(),
     lastError: z.union([z.string(), z.null()]),
     historyCount: z.number().int().nonnegative(),
-    threadOwnerCount: z.number().int().nonnegative()
+    threadOwnerCount: z.number().int().nonnegative(),
+    timings: UnifiedRealtimeServerTimingsSchema.optional(),
   })
   .strict();
 
@@ -1562,6 +1688,7 @@ const ITEM_KIND_COVERAGE: Record<UnifiedItemKind, true> = {
   contextCompaction: true,
   webSearch: true,
   mcpToolCall: true,
+  dynamicToolCall: true,
   collabAgentToolCall: true,
   imageView: true,
   enteredReviewMode: true,

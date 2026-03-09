@@ -22,9 +22,11 @@ import {
   UnifiedRealtimeCoreStateSchema,
   UnifiedRealtimeThreadStateSchema,
   type JsonValue,
+  type UnifiedEventKind,
   type UnifiedFeatureAvailability,
   type UnifiedFeatureId,
   type UnifiedProviderId,
+  type UnifiedThread,
   type UnifiedThreadSummary,
 } from "@farfield/unified-surface";
 import {
@@ -39,15 +41,20 @@ import {
 } from "./agents/cli-options.js";
 import { AgentRegistry } from "./agents/registry.js";
 import { ThreadIndex } from "./agents/thread-index.js";
-import { CodexAgentAdapter } from "./agents/adapters/codex-agent.js";
+import {
+  CodexAgentAdapter,
+  type CodexAppFrameEvent,
+} from "./agents/adapters/codex-agent.js";
 import { OpenCodeAgentAdapter } from "./agents/adapters/opencode-agent.js";
 import type { AgentAdapter } from "./agents/types.js";
 import {
   UnifiedBackendFeatureError,
   buildUnifiedFeatureMatrix,
   createUnifiedProviderAdapters,
+  mapThread,
 } from "./unified/adapter.js";
 import { RealtimeCoordinator } from "./realtime/coordinator.js";
+import { ServerTimingTracker, type ServerTimingSnapshot } from "./perf-metrics.js";
 
 const HOST = process.env["HOST"] ?? "127.0.0.1";
 const PORT = Number(process.env["PORT"] ?? 4311);
@@ -55,6 +62,18 @@ const HISTORY_LIMIT = 2_000;
 const USER_AGENT = "farfield/0.2.2";
 const IPC_RECONNECT_DELAY_MS = 1_000;
 const SIDEBAR_PREVIEW_MAX_CHARS = 180;
+const CORE_RELEVANT_CODEX_NOTIFICATION_METHODS = new Set<
+  AppServerServerNotificationMethod
+>([
+  "thread/archived",
+  "thread/closed",
+  "thread/compacted",
+  "thread/name/updated",
+  "thread/started",
+  "thread/unarchived",
+  "turn/completed",
+  "turn/started",
+]);
 
 const TRACE_DIR = path.resolve(process.cwd(), "traces");
 const DEFAULT_WORKSPACE = path.resolve(process.cwd());
@@ -114,6 +133,7 @@ interface RuntimeStateSnapshot {
   historyCount: number;
   threadOwnerCount: number;
   activeTrace: TraceSummary | null;
+  timings: ServerTimingSnapshot;
 }
 
 function resolveCodexExecutablePath(): string {
@@ -284,6 +304,7 @@ const threadIndex = new ThreadIndex();
 let activeTrace: ActiveTrace | null = null;
 const recentTraces: TraceSummary[] = [];
 let runtimeLastError: string | null = null;
+const timingTracker = new ServerTimingTracker();
 
 function recordTraceEvent(event: unknown): void {
   if (!activeTrace) {
@@ -321,7 +342,6 @@ function pushHistory(
 
   recordTraceEvent({ type: "history", ...entry });
   queueDebugDelta?.();
-  queueCoreDelta?.();
   return entry;
 }
 
@@ -350,8 +370,14 @@ for (const agentId of configuredAgentIds) {
       workspaceDir: DEFAULT_WORKSPACE,
       userAgent: USER_AGENT,
       reconnectDelayMs: IPC_RECONNECT_DELAY_MS,
-      onStateChange: () => {
+      onRuntimeStateChange: () => {
         queueCoreDelta?.();
+      },
+      onThreadStateChange: (threadId) => {
+        queueThreadDelta?.(threadId);
+      },
+      onTiming: (metricId, durationMs) => {
+        timingTracker.record(metricId, durationMs);
       },
     });
 
@@ -361,13 +387,19 @@ for (const agentId of configuredAgentIds) {
         threadId: event.threadId,
       });
       queueDebugDelta?.();
-      queueCoreDelta?.();
-      if (event.threadId) {
-        queueThreadDelta?.(event.threadId);
-      }
       if (event.direction === "in") {
         classifyCodexFrameForRealtime(event.frame);
       }
+    });
+
+    codexAdapter.onAppFrame((event) => {
+      pushHistory("app", event.direction, event.frame, {
+        kind: event.kind,
+        method: event.method,
+        threadId: event.threadId,
+      });
+      queueDebugDelta?.();
+      classifyCodexAppFrameForRealtime(event);
     });
 
     adapters.push(codexAdapter);
@@ -414,6 +446,7 @@ function getRuntimeStateSnapshot(): RuntimeStateSnapshot {
     historyCount: history.length,
     threadOwnerCount: codexAdapter?.getThreadOwnerCount() ?? 0,
     activeTrace: activeTrace?.summary ?? null,
+    timings: timingTracker.snapshot(),
   };
 }
 
@@ -423,6 +456,62 @@ function resolveUnifiedAdapter(provider: UnifiedProviderId) {
 
 function listUnifiedProviders(): UnifiedProviderId[] {
   return configuredUnifiedProviders;
+}
+
+interface DiscoveredUnifiedThread {
+  provider: UnifiedProviderId;
+  thread: UnifiedThread;
+}
+
+async function readUnifiedThreadDirect(input: {
+  provider: UnifiedProviderId;
+  threadId: string;
+  includeTurns: boolean;
+}): Promise<UnifiedThread> {
+  const agent = registry.getAdapter(input.provider);
+  if (!agent || !agent.isEnabled()) {
+    throw new UnifiedBackendFeatureError(
+      input.provider,
+      "readThread",
+      "providerDisabled",
+    );
+  }
+
+  const result = await agent.readThread({
+    threadId: input.threadId,
+    includeTurns: input.includeTurns,
+  });
+  return mapThread(input.provider, result.thread);
+}
+
+async function discoverUnifiedThreads(input: {
+  threadId: string;
+  includeTurns: boolean;
+}): Promise<DiscoveredUnifiedThread[]> {
+  const matches = await Promise.all(
+    listUnifiedProviders().map(
+      async (provider): Promise<DiscoveredUnifiedThread | null> => {
+        try {
+          const thread = await readUnifiedThreadDirect({
+            provider,
+            threadId: input.threadId,
+            includeTurns: input.includeTurns,
+          });
+          threadIndex.register(thread.id, thread.provider);
+          return {
+            provider,
+            thread,
+          };
+        } catch {
+          return null;
+        }
+      },
+    ),
+  );
+
+  return matches.filter(
+    (match): match is DiscoveredUnifiedThread => match !== null,
+  );
 }
 
 interface ProviderErrorPayload {
@@ -563,170 +652,254 @@ async function listUnifiedSidebarThreads(
 }
 
 async function buildRealtimeCoreState() {
-  const [sidebar, rateLimits, features] = await Promise.all([
-    listUnifiedSidebarThreads({
-      limit: 80,
-      archived: false,
-      all: false,
-      maxPages: 1,
-      cursor: null,
-    }),
-    readRateLimitsSafe(),
-    Promise.resolve(
-      buildUnifiedFeatureMatrix({
-        codex: codexAdapter,
-        opencode: openCodeAdapter,
+  const startedAt = performance.now();
+  try {
+    const [sidebar, rateLimits, features] = await Promise.all([
+      listUnifiedSidebarThreads({
+        limit: 80,
+        archived: false,
+        all: false,
+        maxPages: 1,
+        cursor: null,
       }),
-    ),
-  ]);
+      readRateLimitsSafe(),
+      Promise.resolve(
+        buildUnifiedFeatureMatrix({
+          codex: codexAdapter,
+          opencode: openCodeAdapter,
+        }),
+      ),
+    ]);
 
-  const agents = await Promise.all(
-    listUnifiedProviders().map(async (provider) => {
-      const providerFeatures = features[provider];
-      const enabled = registry.getAdapter(provider)?.isEnabled() ?? false;
-      const connected = registry.getAdapter(provider)?.isConnected() ?? false;
-      const adapter = resolveUnifiedAdapter(provider);
-      let projectDirectories: string[] = [];
+    const agents = await Promise.all(
+      listUnifiedProviders().map(async (provider) => {
+        const providerFeatures = features[provider];
+        const enabled = registry.getAdapter(provider)?.isEnabled() ?? false;
+        const connected = registry.getAdapter(provider)?.isConnected() ?? false;
+        const adapter = resolveUnifiedAdapter(provider);
+        let projectDirectories: string[] = [];
 
-      if (
-        adapter &&
-        isFeatureAvailable(providerFeatures.listProjectDirectories)
-      ) {
-        try {
-          const result = await adapter.execute({
-            kind: "listProjectDirectories",
-            provider,
-          });
-          projectDirectories = result.directories;
-        } catch {
-          projectDirectories = [];
+        if (
+          adapter &&
+          isFeatureAvailable(providerFeatures.listProjectDirectories)
+        ) {
+          try {
+            const result = await adapter.execute({
+              kind: "listProjectDirectories",
+              provider,
+            });
+            projectDirectories = result.directories;
+          } catch {
+            projectDirectories = [];
+          }
         }
-      }
 
-      return {
-        id: provider,
-        label: provider === "codex" ? "Codex" : "OpenCode",
-        enabled,
-        connected,
-        features: providerFeatures,
-        capabilities: buildAgentCapabilities(providerFeatures),
-        projectDirectories,
-      };
-    }),
-  );
+        return {
+          id: provider,
+          label: provider === "codex" ? "Codex" : "OpenCode",
+          enabled,
+          connected,
+          features: providerFeatures,
+          capabilities: buildAgentCapabilities(providerFeatures),
+          projectDirectories,
+        };
+      }),
+    );
 
-  const defaultAgentId = agents.find((agent) => agent.enabled)?.id ?? "codex";
-  const traceStatus = {
-    active: activeTrace?.summary ?? null,
-    recent: recentTraces,
-  };
-  const historyList = history.slice(-120).map(toDebugHistoryListEntry);
-  const runtimeState = getRuntimeStateSnapshot();
+    const defaultAgentId = agents.find((agent) => agent.enabled)?.id ?? "codex";
+    const traceStatus = {
+      active: activeTrace?.summary ?? null,
+      recent: recentTraces,
+    };
+    const historyList = history.slice(-120).map(toDebugHistoryListEntry);
+    const runtimeState = getRuntimeStateSnapshot();
 
-  return UnifiedRealtimeCoreStateSchema.parse({
-    health: {
-      appReady: runtimeState.appReady,
-      ipcConnected: runtimeState.ipcConnected,
-      ipcInitialized: runtimeState.ipcInitialized,
-      gitCommit: runtimeState.gitCommit,
-      lastError: runtimeState.lastError,
-      historyCount: runtimeState.historyCount,
-      threadOwnerCount: runtimeState.threadOwnerCount,
-    },
-    agents: {
-      agents,
-      defaultAgentId,
-    },
-    sidebar,
-    rateLimits,
-    traceStatus,
-    history: historyList,
-  });
+    return UnifiedRealtimeCoreStateSchema.parse({
+      health: {
+        appReady: runtimeState.appReady,
+        ipcConnected: runtimeState.ipcConnected,
+        ipcInitialized: runtimeState.ipcInitialized,
+        gitCommit: runtimeState.gitCommit,
+        lastError: runtimeState.lastError,
+        historyCount: runtimeState.historyCount,
+        threadOwnerCount: runtimeState.threadOwnerCount,
+        timings: runtimeState.timings,
+      },
+      agents: {
+        agents,
+        defaultAgentId,
+      },
+      sidebar,
+      rateLimits,
+      traceStatus,
+      history: historyList,
+    });
+  } finally {
+    timingTracker.record("realtimeCoreBuild", performance.now() - startedAt);
+  }
 }
 
 async function buildRealtimeThreadState(input: {
   threadId: string;
   includeStreamEvents: boolean;
 }) {
-  const knownProviders = threadIndex.providers(input.threadId);
-  const provider = threadIndex.resolve(input.threadId);
+  const startedAt = performance.now();
+  try {
+    const knownProviders = threadIndex.providers(input.threadId);
+    let provider = threadIndex.resolve(input.threadId);
+    let discoveredThread: UnifiedThread | null = null;
 
-  if (!provider) {
-    if (knownProviders.length > 1) {
+    if (!provider) {
+      if (knownProviders.length > 1) {
+        return null;
+      }
+
+      const discoveredMatches = await discoverUnifiedThreads({
+        threadId: input.threadId,
+        includeTurns: true,
+      });
+      if (discoveredMatches.length !== 1) {
+        return null;
+      }
+
+      provider = discoveredMatches[0]?.provider ?? null;
+      discoveredThread = discoveredMatches[0]?.thread ?? null;
+      if (!provider) {
+        return null;
+      }
+    }
+
+    const adapter = resolveUnifiedAdapter(provider);
+    if (!adapter) {
       return null;
     }
-    return null;
-  }
 
-  const adapter = resolveUnifiedAdapter(provider);
-  if (!adapter) {
-    return null;
-  }
-
-  let readResult: Awaited<ReturnType<typeof adapter.execute>>;
-  try {
-    readResult = await adapter.execute({
-      kind: "readThread",
-      provider,
-      threadId: input.threadId,
-      includeTurns: true,
-    });
-  } catch {
-    return null;
-  }
-
-  if (readResult.kind !== "readThread") {
-    return null;
-  }
-
-  threadIndex.register(readResult.thread.id, readResult.thread.provider);
-
-  const liveResult = adapter.getFeatureAvailability().readLiveState.status === "available"
-    ? await adapter.execute({
-        kind: "readLiveState",
-        provider,
-        threadId: input.threadId,
-      })
-    : {
-        kind: "readLiveState" as const,
-        threadId: input.threadId,
-        ownerClientId: null,
-        conversationState: null,
-        liveStateError: null,
-      };
-  if (liveResult.kind !== "readLiveState") {
-    return null;
-  }
-
-  const streamResult =
-    input.includeStreamEvents &&
-    adapter.getFeatureAvailability().readStreamEvents.status === "available"
-      ? await adapter.execute({
-          kind: "readStreamEvents",
-          provider,
-          threadId: input.threadId,
-          limit: 80,
-        })
-      : {
-          kind: "readStreamEvents" as const,
-          threadId: input.threadId,
-          ownerClientId: null,
-          events: [],
+    let liveResult:
+      | Awaited<ReturnType<typeof adapter.execute>>
+      | {
+          kind: "readLiveState";
+          threadId: string;
+          ownerClientId: null;
+          conversationState: null;
+          liveStateError: null;
         };
-  if (streamResult.kind !== "readStreamEvents") {
-    return null;
-  }
+    try {
+      liveResult =
+        adapter.getFeatureAvailability().readLiveState.status === "available"
+          ? await adapter.execute({
+              kind: "readLiveState",
+              provider,
+              threadId: input.threadId,
+            })
+          : {
+              kind: "readLiveState" as const,
+              threadId: input.threadId,
+              ownerClientId: null,
+              conversationState: null,
+              liveStateError: null,
+            };
+    } catch (error) {
+      if (
+        error instanceof UnifiedBackendFeatureError &&
+        error.provider === provider &&
+        error.featureId === "readLiveState" &&
+        error.reason === "providerDisconnected"
+      ) {
+        return null;
+      }
+      throw error;
+    }
+    if (liveResult.kind !== "readLiveState") {
+      return null;
+    }
 
-  return UnifiedRealtimeThreadStateSchema.parse({
-    threadId: input.threadId,
-    readThread: readResult.thread,
-    liveState: {
-      ownerClientId: liveResult.ownerClientId,
-      conversationState: liveResult.conversationState,
-      liveStateError: liveResult.liveStateError ?? null,
-    },
-    streamEvents: streamResult.events,
-  });
+    let readThread = liveResult.conversationState;
+    if (!readThread) {
+      if (discoveredThread) {
+        readThread = discoveredThread;
+      } else {
+        let readResult: Awaited<ReturnType<typeof adapter.execute>>;
+        try {
+          readResult = await adapter.execute({
+            kind: "readThread",
+            provider,
+            threadId: input.threadId,
+            includeTurns: true,
+          });
+        } catch (error) {
+          if (
+            error instanceof UnifiedBackendFeatureError &&
+            error.provider === provider &&
+            error.featureId === "readThread" &&
+            error.reason === "providerDisconnected"
+          ) {
+            return null;
+          }
+          throw error;
+        }
+
+        if (readResult.kind !== "readThread") {
+          return null;
+        }
+
+        readThread = readResult.thread;
+      }
+    }
+
+    threadIndex.register(readThread.id, readThread.provider);
+
+    let streamResult:
+      | Awaited<ReturnType<typeof adapter.execute>>
+      | {
+          kind: "readStreamEvents";
+          threadId: string;
+          ownerClientId: null;
+          events: [];
+        };
+    try {
+      streamResult =
+        input.includeStreamEvents &&
+        adapter.getFeatureAvailability().readStreamEvents.status === "available"
+          ? await adapter.execute({
+              kind: "readStreamEvents",
+              provider,
+              threadId: input.threadId,
+              limit: 80,
+            })
+          : {
+              kind: "readStreamEvents" as const,
+              threadId: input.threadId,
+              ownerClientId: null,
+              events: [],
+            };
+    } catch (error) {
+      if (
+        error instanceof UnifiedBackendFeatureError &&
+        error.provider === provider &&
+        error.featureId === "readStreamEvents" &&
+        error.reason === "providerDisconnected"
+      ) {
+        return null;
+      }
+      throw error;
+    }
+    if (streamResult.kind !== "readStreamEvents") {
+      return null;
+    }
+
+    return UnifiedRealtimeThreadStateSchema.parse({
+      threadId: input.threadId,
+      readThread,
+      liveState: {
+        ownerClientId: liveResult.ownerClientId,
+        conversationState: liveResult.conversationState,
+        liveStateError: liveResult.liveStateError ?? null,
+      },
+      streamEvents: streamResult.events,
+    });
+  } finally {
+    timingTracker.record("realtimeThreadBuild", performance.now() - startedAt);
+  }
 }
 
 async function buildRealtimeDebugState() {
@@ -759,7 +932,9 @@ function classifyCodexFrameForRealtime(frame: IpcFrame): void {
         frame.method as AppServerServerRequestMethod,
       );
       if (mapping.status === "exposed") {
-        queueCoreDelta?.();
+        if (shouldQueueCoreDeltaForCodexRequest()) {
+          queueCoreDelta?.();
+        }
         if (mapping.eventKind === "error") {
           broadcastSyncError?.(
             `Codex request event reported error for method ${frame.method}`,
@@ -783,7 +958,14 @@ function classifyCodexFrameForRealtime(frame: IpcFrame): void {
         frame.method as AppServerServerNotificationMethod,
       );
       if (mapping.status === "exposed") {
-        queueCoreDelta?.();
+        if (
+          shouldQueueCoreDeltaForCodexNotification(
+            frame.method as AppServerServerNotificationMethod,
+            mapping.eventKind,
+          )
+        ) {
+          queueCoreDelta?.();
+        }
         if (mapping.eventKind === "error") {
           broadcastSyncError?.(
             `Codex notification reported error for method ${frame.method}`,
@@ -799,6 +981,69 @@ function classifyCodexFrameForRealtime(frame: IpcFrame): void {
       return;
     }
   }
+}
+
+function classifyCodexAppFrameForRealtime(event: CodexAppFrameEvent): void {
+  if (event.kind === "request") {
+    const mapping = getCodexServerRequestMethodMapping(
+      event.frame.method as AppServerServerRequestMethod,
+    );
+    if (mapping.status !== "exposed") {
+      return;
+    }
+    if (shouldQueueCoreDeltaForCodexRequest()) {
+      queueCoreDelta?.();
+    }
+    if (mapping.eventKind === "error") {
+      broadcastSyncError?.(
+        `Codex app request reported error for method ${event.frame.method}`,
+        "codexEventError",
+      );
+    }
+    if (event.threadId) {
+      queueThreadDelta?.(event.threadId);
+    }
+    return;
+  }
+
+  const mapping = getCodexServerNotificationMethodMapping(
+    event.frame.method as AppServerServerNotificationMethod,
+  );
+  if (mapping.status !== "exposed") {
+    return;
+  }
+  if (
+    shouldQueueCoreDeltaForCodexNotification(
+      event.frame.method,
+      mapping.eventKind,
+    )
+  ) {
+    queueCoreDelta?.();
+  }
+  if (mapping.eventKind === "error") {
+    broadcastSyncError?.(
+      `Codex app notification reported error for method ${event.frame.method}`,
+      "codexEventError",
+    );
+  }
+  if (event.threadId) {
+    queueThreadDelta?.(event.threadId);
+  }
+}
+
+function shouldQueueCoreDeltaForCodexRequest(): boolean {
+  return false;
+}
+
+function shouldQueueCoreDeltaForCodexNotification(
+  method: AppServerServerNotificationMethod,
+  eventKind: UnifiedEventKind,
+): boolean {
+  if (eventKind === "providerStateChanged" || eventKind === "error") {
+    return true;
+  }
+
+  return CORE_RELEVANT_CODEX_NOTIFICATION_METHODS.has(method);
 }
 
 function extractThreadIdFromIpcFrame(frame: IpcFrame): string | null {
@@ -1065,7 +1310,8 @@ const server = http.createServer(async (req, res) => {
       );
       const knownProviders = threadIndex.providers(threadId);
       const resolvedProvider = threadIndex.resolve(threadId);
-      const provider = providerFromQuery ?? resolvedProvider;
+      let provider = providerFromQuery ?? resolvedProvider;
+      let discoveredThread: UnifiedThread | null = null;
 
       if (!provider) {
         if (knownProviders.length > 1) {
@@ -1083,21 +1329,71 @@ const server = http.createServer(async (req, res) => {
           return;
         }
 
-        jsonResponse(res, 404, {
-          ok: false,
-          error: {
-            code: "threadNotFound",
-            message: `Thread ${threadId} is not registered`,
-            details: {
-              threadId,
-            },
-          },
+        const discoveredMatches = await discoverUnifiedThreads({
+          threadId,
+          includeTurns,
         });
-        return;
+        if (discoveredMatches.length > 1) {
+          jsonResponse(res, 409, {
+            ok: false,
+            error: {
+              code: "threadProviderAmbiguous",
+              message: `Thread ${threadId} exists in multiple providers; provider query is required`,
+              details: {
+                threadId,
+                providers: discoveredMatches.map((match) => match.provider),
+              },
+            },
+          });
+          return;
+        }
+
+        if (discoveredMatches.length === 1) {
+          provider = discoveredMatches[0]?.provider ?? null;
+          discoveredThread = discoveredMatches[0]?.thread ?? null;
+        }
+
+        if (!provider || !discoveredThread) {
+          const enabledButDisconnectedProvider = listUnifiedProviders().find(
+            (providerId) => {
+              const providerAdapter = registry.getAdapter(providerId);
+              return (
+                providerAdapter?.isEnabled() === true &&
+                providerAdapter.isConnected() === false
+              );
+            },
+          );
+          if (enabledButDisconnectedProvider) {
+            jsonResponse(res, 503, {
+              ok: false,
+              error: {
+                code: "providerDisconnected",
+                message: `Provider ${enabledButDisconnectedProvider} is not ready yet`,
+                details: {
+                  provider: enabledButDisconnectedProvider,
+                  threadId,
+                },
+              },
+            });
+            return;
+          }
+
+          jsonResponse(res, 404, {
+            ok: false,
+            error: {
+              code: "threadNotFound",
+              message: `Thread ${threadId} is not registered`,
+              details: {
+                threadId,
+              },
+            },
+          });
+          return;
+        }
       }
 
-      const adapter = resolveUnifiedAdapter(provider);
-      if (!adapter) {
+      const providerAdapter = registry.getAdapter(provider);
+      if (!providerAdapter || !providerAdapter.isEnabled()) {
         jsonResponse(res, 503, {
           ok: false,
           error: {
@@ -1112,17 +1408,19 @@ const server = http.createServer(async (req, res) => {
       }
 
       try {
-        const result = await adapter.execute({
-          kind: "readThread",
-          provider,
-          threadId,
-          includeTurns,
-        });
+        const thread =
+          discoveredThread && discoveredThread.provider === provider
+            ? discoveredThread
+            : await readUnifiedThreadDirect({
+                provider,
+                threadId,
+                includeTurns,
+              });
 
-        threadIndex.register(result.thread.id, result.thread.provider);
+        threadIndex.register(thread.id, thread.provider);
         jsonResponse(res, 200, {
           ok: true,
-          thread: result.thread,
+          thread,
         });
       } catch (error) {
         const message = toErrorMessage(error);

@@ -211,29 +211,17 @@ export class RealtimeCoordinator {
       return;
     }
 
-    let coreState: UnifiedRealtimeCoreState | null = null;
-    if (shouldSendCore) {
-      try {
-        coreState = await this.buildCoreState();
-      } catch (error) {
-        this.broadcastSyncError(
-          error instanceof Error ? error.message : String(error),
-          "coreDeltaFailed",
-        );
-      }
-    }
+    const coreStatePromise = shouldSendCore
+      ? this.buildCoreState()
+          .then((core) => ({ ok: true as const, core }))
+          .catch((error) => ({ ok: false as const, error }))
+      : null;
 
-    let debugState: RealtimeDebugState | null = null;
-    if (shouldSendDebug) {
-      try {
-        debugState = await this.buildDebugState();
-      } catch (error) {
-        this.broadcastSyncError(
-          error instanceof Error ? error.message : String(error),
-          "debugDeltaFailed",
-        );
-      }
-    }
+    const debugStatePromise = shouldSendDebug
+      ? this.buildDebugState()
+          .then((debug) => ({ ok: true as const, debug }))
+          .catch((error) => ({ ok: false as const, error }))
+      : null;
 
     const threadStateCache = new Map<string, UnifiedRealtimeThreadState | null>();
 
@@ -242,23 +230,6 @@ export class RealtimeCoordinator {
         selectedThreadId: null,
         activeTab: "chat" as const,
       };
-
-      if (coreState) {
-        this.emitMessage(socket, {
-          kind: "coreDelta",
-          syncVersion: this.nextSyncVersion(),
-          core: coreState,
-        });
-      }
-
-      if (debugState && context.activeTab === "debug") {
-        this.emitMessage(socket, {
-          kind: "debugDelta",
-          syncVersion: this.nextSyncVersion(),
-          traceStatus: debugState.traceStatus,
-          history: debugState.history,
-        });
-      }
 
       if (!context.selectedThreadId) {
         continue;
@@ -290,6 +261,55 @@ export class RealtimeCoordinator {
         syncVersion: this.nextSyncVersion(),
         thread: state,
       });
+    }
+
+    if (coreStatePromise) {
+      const coreResult = await coreStatePromise;
+      if (!coreResult.ok) {
+        this.broadcastSyncError(
+          coreResult.error instanceof Error
+            ? coreResult.error.message
+            : String(coreResult.error),
+          "coreDeltaFailed",
+        );
+      } else {
+        for (const socket of sockets.values()) {
+          this.emitMessage(socket, {
+            kind: "coreDelta",
+            syncVersion: this.nextSyncVersion(),
+            core: coreResult.core,
+          });
+        }
+      }
+    }
+
+    if (debugStatePromise) {
+      const debugResult = await debugStatePromise;
+      if (!debugResult.ok) {
+        this.broadcastSyncError(
+          debugResult.error instanceof Error
+            ? debugResult.error.message
+            : String(debugResult.error),
+          "debugDeltaFailed",
+        );
+      } else {
+        for (const [socketId, socket] of sockets.entries()) {
+          const context = this.contextBySocketId.get(socketId) ?? {
+            selectedThreadId: null,
+            activeTab: "chat" as const,
+          };
+          if (context.activeTab !== "debug") {
+            continue;
+          }
+
+          this.emitMessage(socket, {
+            kind: "debugDelta",
+            syncVersion: this.nextSyncVersion(),
+            traceStatus: debugResult.debug.traceStatus,
+            history: debugResult.debug.history,
+          });
+        }
+      }
     }
   }
 

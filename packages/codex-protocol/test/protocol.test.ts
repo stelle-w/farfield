@@ -269,6 +269,50 @@ describe("codex-protocol schemas", () => {
     expect(todoItem?.type).toBe("todo-list");
   });
 
+  it("parses snapshot broadcast when todo-list explanation is null", () => {
+    const parsed = parseThreadStreamStateChangedBroadcast({
+      type: "broadcast",
+      method: "thread-stream-state-changed",
+      sourceClientId: "client-123",
+      version: 4,
+      params: {
+        conversationId: "thread-123",
+        type: "thread-stream-state-changed",
+        version: 4,
+        change: {
+          type: "snapshot",
+          conversationState: {
+            id: "thread-123",
+            turns: [
+              {
+                status: "inProgress",
+                items: [
+                  {
+                    id: "todo-1",
+                    type: "todo-list",
+                    explanation: null,
+                    plan: [
+                      { step: "Gather context", status: "completed" },
+                      { step: "Implement fix", status: "inProgress" }
+                    ]
+                  }
+                ]
+              }
+            ],
+            requests: []
+          }
+        }
+      }
+    });
+
+    expect(parsed.params.change.type).toBe("snapshot");
+    const todoItem = parsed.params.change.type === "snapshot"
+      ? parsed.params.change.conversationState.turns[0]?.items[0]
+      : null;
+    expect(todoItem?.type).toBe("todo-list");
+    expect(todoItem?.explanation).toBeNull();
+  });
+
   it("parses snapshot broadcast when turn includes remoteTaskCreated item", () => {
     const parsed = parseThreadStreamStateChangedBroadcast({
       type: "broadcast",
@@ -1000,6 +1044,86 @@ describe("codex-protocol schemas", () => {
     expect(parsed.thread.id).toBe("thread-123");
     expect(parsed.thread.requests).toEqual([]);
     expect(parsed.thread.turns[0]?.status).toBe("completed");
+  });
+
+  it("parses app-server thread/read response with dynamic tool calls and rich user input parts", () => {
+    const parsed = parseAppServerReadThreadResponse({
+      thread: {
+        id: "thread-789",
+        preview: "tool work",
+        modelProvider: "openai",
+        createdAt: 1700000000,
+        updatedAt: 1700000000,
+        cwd: "/tmp/workspace",
+        source: "appServer",
+        status: {
+          type: "active",
+          activeFlags: ["waitingOnUserInput"],
+        },
+        cliVersion: "0.1.0",
+        turns: [
+          {
+            id: "turn-1",
+            status: "inProgress",
+            items: [
+              {
+                id: "item-user-1",
+                type: "userMessage",
+                content: [
+                  {
+                    type: "text",
+                    text: "Use this skill",
+                    text_elements: [],
+                  },
+                  {
+                    type: "skill",
+                    name: "openai-docs",
+                    path: "/Users/anshu/.codex/skills/openai-docs/SKILL.md",
+                  },
+                  {
+                    type: "localImage",
+                    path: "/tmp/example.png",
+                  },
+                ],
+              },
+              {
+                id: "item-tool-1",
+                type: "dynamicToolCall",
+                tool: "browser.open",
+                arguments: {
+                  url: "https://example.com",
+                },
+                status: "completed",
+                contentItems: [
+                  {
+                    type: "inputText",
+                    text: "Opened example.com",
+                  },
+                ],
+                success: true,
+                durationMs: 42,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(parsed.thread.status?.type).toBe("active");
+    const dynamicToolItem = parsed.thread.turns[0]?.items[1];
+    expect(dynamicToolItem?.type).toBe("dynamicToolCall");
+    expect(
+      dynamicToolItem && dynamicToolItem.type === "dynamicToolCall"
+        ? dynamicToolItem.tool
+        : null,
+    ).toBe("browser.open");
+    const userMessageItem = parsed.thread.turns[0]?.items[0];
+    expect(userMessageItem?.type).toBe("userMessage");
+    expect(
+      userMessageItem && userMessageItem.type === "userMessage"
+        ? userMessageItem.content[1]?.type
+        : null,
+    ).toBe("skill");
   });
 
   it("parses app-server thread/start response", () => {

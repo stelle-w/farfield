@@ -75,14 +75,23 @@ export interface AgentSendMessageInput {
   text: string;
   ownerClientId?: string;
   cwd?: string;
+  model?: string;
+  effort?: string;
+  collaborationMode?: AgentTurnCollaborationMode | null;
   isSteering?: boolean;
 }
 
 export interface AgentSetCollaborationModeInput {
   threadId: string;
   ownerClientId?: string;
-  collaborationMode: CollaborationMode;
+  collaborationMode: AgentTurnCollaborationMode;
 }
+
+export type AgentTurnCollaborationMode = CollaborationMode & {
+  settings: CollaborationMode["settings"] & {
+    model: string;
+  };
+};
 
 export interface AgentSubmitUserInputInput {
   threadId: string;

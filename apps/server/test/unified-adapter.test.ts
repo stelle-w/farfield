@@ -42,6 +42,7 @@ const CODEx_CAPABILITIES: AgentCapabilities = {
   canSubmitUserInput: true,
   canReadLiveState: true,
   canReadStreamEvents: true,
+  canReadRateLimits: true,
 };
 
 const OPENCODE_CAPABILITIES: AgentCapabilities = {
@@ -51,6 +52,7 @@ const OPENCODE_CAPABILITIES: AgentCapabilities = {
   canSubmitUserInput: false,
   canReadLiveState: false,
   canReadStreamEvents: false,
+  canReadRateLimits: false,
 };
 
 function createCodexAdapter(): AgentAdapter {
@@ -331,6 +333,39 @@ describe("unified provider adapters", () => {
     if (matrix.opencode.listModels.status === "unavailable") {
       expect(matrix.opencode.listModels.reason).toBe("unsupportedByProvider");
     }
+  });
+
+  it("requires an explicit collaboration mode model for send and set commands", () => {
+    expect(() =>
+      UnifiedCommandSchema.parse({
+        kind: "sendMessage",
+        provider: "codex",
+        threadId: SAMPLE_THREAD.id,
+        text: "hello",
+        collaborationMode: {
+          mode: "plan",
+          settings: {
+            reasoningEffort: "high",
+            developerInstructions: "plan",
+          },
+        },
+      }),
+    ).toThrowError(/model/i);
+
+    expect(() =>
+      UnifiedCommandSchema.parse({
+        kind: "setCollaborationMode",
+        provider: "codex",
+        threadId: SAMPLE_THREAD.id,
+        collaborationMode: {
+          mode: "plan",
+          settings: {
+            reasoningEffort: "high",
+            developerInstructions: "plan",
+          },
+        },
+      }),
+    ).toThrowError(/model/i);
   });
 
   it("handles every command kind for both providers", async () => {
@@ -614,5 +649,90 @@ describe("unified provider adapters", () => {
         ? remoteTaskItem.taskId
         : null,
     ).toBe("task-123");
+  });
+
+  it("maps dynamicToolCall turn items and richer user message parts into unified items", async () => {
+    const adapter = createCodexAdapter();
+    adapter.readThread = async () => ({
+      thread: {
+        ...SAMPLE_THREAD,
+        status: {
+          type: "active",
+          activeFlags: ["waitingOnUserInput"],
+        },
+        turns: [
+          {
+            id: "turn-1",
+            status: "inProgress",
+            items: [
+              {
+                id: "item-user-1",
+                type: "userMessage",
+                content: [
+                  {
+                    type: "text",
+                    text: "Check this skill",
+                    text_elements: [],
+                  },
+                  {
+                    type: "mention",
+                    name: "README.md",
+                    path: "/tmp/project/README.md",
+                  },
+                ],
+              },
+              {
+                id: "item-tool-1",
+                type: "dynamicToolCall",
+                tool: "browser.open",
+                arguments: {
+                  url: "https://example.com",
+                },
+                status: "completed",
+                contentItems: [
+                  {
+                    type: "inputText",
+                    text: "Opened example.com",
+                  },
+                ],
+                success: true,
+                durationMs: 17,
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    const unified = new AgentUnifiedProviderAdapter("codex", adapter);
+    const result = await unified.execute(
+      UnifiedCommandSchema.parse({
+        kind: "readThread",
+        provider: "codex",
+        threadId: SAMPLE_THREAD.id,
+        includeTurns: true,
+      }),
+    );
+
+    expect(result.kind).toBe("readThread");
+    if (result.kind !== "readThread") {
+      return;
+    }
+
+    const userItem = result.thread.turns[0]?.items[0];
+    expect(userItem?.type).toBe("userMessage");
+    expect(
+      userItem && userItem.type === "userMessage"
+        ? userItem.content[1]?.type
+        : null,
+    ).toBe("mention");
+
+    const dynamicToolItem = result.thread.turns[0]?.items[1];
+    expect(dynamicToolItem?.type).toBe("dynamicToolCall");
+    expect(
+      dynamicToolItem && dynamicToolItem.type === "dynamicToolCall"
+        ? dynamicToolItem.tool
+        : null,
+    ).toBe("browser.open");
   });
 });

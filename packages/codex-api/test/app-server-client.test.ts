@@ -23,6 +23,8 @@ describe("AppServerClient.startThread", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue(START_THREAD_RESPONSE),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined),
     };
 
@@ -41,6 +43,8 @@ describe("AppServerClient.startThread", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue(START_THREAD_RESPONSE),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined),
     };
 
@@ -62,6 +66,8 @@ describe("AppServerClient.sendUserMessage", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({}),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -84,6 +90,8 @@ describe("AppServerClient.sendUserMessage", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({ ok: true }),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -103,6 +111,8 @@ describe("AppServerClient.resumeThread", () => {
         }
       }),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -121,6 +131,8 @@ describe("AppServerClient.turn controls", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({}),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -143,6 +155,8 @@ describe("AppServerClient.turn controls", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({}),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -164,6 +178,8 @@ describe("AppServerClient.turn controls", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({}),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined)
     };
 
@@ -182,6 +198,8 @@ describe("AppServerClient.submitUserInput", () => {
     const transport: AppServerTransport = {
       request: vi.fn().mockResolvedValue({}),
       respond: vi.fn().mockResolvedValue(undefined),
+      onServerNotification: vi.fn().mockReturnValue(() => {}),
+      onServerRequest: vi.fn().mockReturnValue(() => {}),
       close: vi.fn().mockResolvedValue(undefined),
     };
 

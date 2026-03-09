@@ -1,7 +1,6 @@
 import {
   startTransition,
   useCallback,
-  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -28,6 +27,7 @@ import {
 } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
+  ApiRequestError,
   clearServerBaseUrl,
   createThread,
   getDefaultServerBaseUrl,
@@ -141,6 +141,19 @@ type ConversationTurn = NonNullable<
 type ConversationTurnItem = NonNullable<ConversationTurn["items"]>[number];
 type FlatConversationItem = ChatTimelineEntry;
 
+function formatTimingSummary(
+  metric:
+    | NonNullable<NonNullable<Health["state"]["timings"]>["realtimeCoreBuild"]>
+    | null
+    | undefined,
+): string {
+  if (!metric) {
+    return "n/a";
+  }
+
+  return `${metric.lastMs}ms last, ${metric.avgMs}ms avg, ${metric.maxMs}ms max`;
+}
+
 function toTraceStatusState(
   traceStatus: UnifiedRealtimeCoreState["traceStatus"],
 ): TraceStatus | null {
@@ -209,6 +222,43 @@ interface ProviderCatalogCacheEntry {
   modes: ModesResponse["data"];
   models: ModelsResponse["data"];
   fetchedAt: number;
+}
+
+function collectThreadProviderCandidates(input: {
+  threadId: string;
+  providerByThreadId: ReadonlyMap<string, AgentId>;
+  selectedThreadId: string | null;
+  selectedThreadProvider: AgentId | null;
+  resolvedSelectedThreadProvider: AgentId | null;
+  cachedThreadState: CachedThreadViewState | null;
+  readThreadState: ReadThreadResponse | null;
+  liveState: LiveStateResponse | null;
+}): AgentId[] {
+  const candidates: AgentId[] = [];
+
+  const pushCandidate = (provider: AgentId | null | undefined): void => {
+    if (!provider || candidates.includes(provider)) {
+      return;
+    }
+    candidates.push(provider);
+  };
+
+  pushCandidate(input.providerByThreadId.get(input.threadId) ?? null);
+  pushCandidate(input.cachedThreadState?.readThreadState?.thread.provider ?? null);
+  pushCandidate(
+    input.cachedThreadState?.liveState?.conversationState?.provider ?? null,
+  );
+
+  if (input.selectedThreadId !== input.threadId) {
+    return candidates;
+  }
+
+  pushCandidate(input.selectedThreadProvider);
+  pushCandidate(input.resolvedSelectedThreadProvider);
+  pushCandidate(input.readThreadState?.thread.provider ?? null);
+  pushCandidate(input.liveState?.conversationState?.provider ?? null);
+
+  return candidates;
 }
 
 interface AppViewSnapshot {
@@ -506,9 +556,19 @@ function shouldRenderConversationItem(item: ConversationTurnItem): boolean {
   switch (item.type) {
     case "userMessage":
     case "steeringUserMessage":
-      return item.content.some(
-        (part) => part.type === "text" && part.text.length > 0,
-      );
+      return item.content.some((part) => {
+        switch (part.type) {
+          case "text":
+            return part.text.length > 0;
+          case "image":
+          case "localImage":
+          case "skill":
+          case "mention":
+            return true;
+          default:
+            return false;
+        }
+      });
     case "agentMessage":
       return item.text.length > 0;
     case "reasoning": {
@@ -569,7 +629,6 @@ const EFFORT_ORDER: ReadonlyArray<string> = DEFAULT_EFFORT_OPTIONS;
 const INITIAL_VISIBLE_CHAT_ITEMS = 90;
 const VISIBLE_CHAT_ITEMS_STEP = 80;
 const APP_DEFAULT_VALUE = "__app_default__";
-const ASSUMED_APP_DEFAULT_MODEL = "gpt-5.3-codex";
 const ASSUMED_APP_DEFAULT_EFFORT = "medium";
 const AGENT_CACHE_TTL_MS = 30_000;
 const PROVIDER_CATALOG_CACHE_TTL_MS = 20_000;
@@ -673,6 +732,21 @@ function getConversationStateUpdatedAt(
   return state.updatedAt;
 }
 
+function getConversationStateRichness(
+  state: NonNullable<ReadThreadResponse["thread"]> | null | undefined,
+): number {
+  if (!state) {
+    return Number.NEGATIVE_INFINITY;
+  }
+
+  let itemCount = 0;
+  for (const turn of state.turns) {
+    itemCount += turn.items.length;
+  }
+
+  return itemCount * 10 + state.requests.length;
+}
+
 function buildApprovalResponse(
   request: PendingApprovalRequest,
   action: "approve" | "deny",
@@ -727,18 +801,72 @@ function normalizeNullableModeValue(value: string | null | undefined): string {
   return normalized.length > 0 ? normalized : "";
 }
 
-function normalizeModeSettingValue(
-  value: string | null | undefined,
-  assumedDefault: string,
+function findModeDefinition(
+  modes: ModesResponse["data"],
+  modeKey: string | null | undefined,
+): ModesResponse["data"][number] | null {
+  const normalizedModeKey = normalizeNullableModeValue(modeKey);
+  if (normalizedModeKey.length === 0) {
+    return null;
+  }
+  return modes.find((entry) => entry.mode === normalizedModeKey) ?? null;
+}
+
+function buildModelOptionLabel(
+  models: ModelsResponse["data"],
+  modelId: string,
 ): string {
-  const normalized = normalizeNullableModeValue(value);
-  if (!normalized) {
-    return "";
+  const model = models.find((entry) => entry.id === modelId) ?? null;
+  if (!model) {
+    return modelId;
   }
-  if (normalized === assumedDefault) {
-    return "";
+  if (model.displayName && model.displayName !== model.id) {
+    return `${model.displayName} (${model.id})`;
   }
-  return normalized;
+  return model.displayName || model.id;
+}
+
+function resolveCollaborationModeModelId(input: {
+  requestedModelId: string | null | undefined;
+  modeKey: string | null | undefined;
+  modes: ModesResponse["data"];
+  models: ModelsResponse["data"];
+  state: NonNullable<ReadThreadResponse["thread"]> | null;
+}): string {
+  const requestedModelId = normalizeNullableModeValue(input.requestedModelId);
+  if (requestedModelId.length > 0) {
+    return requestedModelId;
+  }
+
+  const latestModeModelId = normalizeNullableModeValue(
+    input.state?.latestCollaborationMode?.settings.model,
+  );
+  if (latestModeModelId.length > 0) {
+    return latestModeModelId;
+  }
+
+  const latestModelId = normalizeNullableModeValue(input.state?.latestModel);
+  if (latestModelId.length > 0) {
+    return latestModelId;
+  }
+
+  const modeDefinition = findModeDefinition(
+    input.modes,
+    input.modeKey ?? input.state?.latestCollaborationMode?.mode ?? null,
+  );
+  const modeModelId = normalizeNullableModeValue(modeDefinition?.model);
+  if (modeModelId.length > 0) {
+    return modeModelId;
+  }
+
+  const defaultModelId = normalizeNullableModeValue(
+    input.models.find((entry) => entry.isDefault)?.id,
+  );
+  if (defaultModelId.length > 0) {
+    return defaultModelId;
+  }
+
+  return normalizeNullableModeValue(input.models[0]?.id);
 }
 
 function readModeSelectionFromConversationState(
@@ -757,39 +885,28 @@ function readModeSelectionFromConversationState(
   }
 
   if (state.latestCollaborationMode) {
-    const modelId =
-      normalizeModeSettingValue(
-        state.latestCollaborationMode.settings.model,
-        ASSUMED_APP_DEFAULT_MODEL,
-      ) ||
-      normalizeModeSettingValue(state.latestModel, ASSUMED_APP_DEFAULT_MODEL);
-    const reasoningEffort =
-      normalizeModeSettingValue(
-        state.latestCollaborationMode.settings.reasoningEffort,
-        ASSUMED_APP_DEFAULT_EFFORT,
-      ) ||
-      normalizeModeSettingValue(
-        state.latestReasoningEffort,
-        ASSUMED_APP_DEFAULT_EFFORT,
-      );
+    const modeModelId = normalizeNullableModeValue(
+      state.latestCollaborationMode.settings.model,
+    );
+    const latestModelId = normalizeNullableModeValue(state.latestModel);
+    const modeReasoningEffort = normalizeNullableModeValue(
+      state.latestCollaborationMode.settings.reasoningEffort,
+    );
+    const latestReasoningEffort = normalizeNullableModeValue(
+      state.latestReasoningEffort,
+    );
 
     return {
       modeKey: state.latestCollaborationMode.mode,
-      modelId,
-      reasoningEffort,
+      modelId: modeModelId || latestModelId,
+      reasoningEffort: modeReasoningEffort || latestReasoningEffort,
     };
   }
 
   return {
     modeKey: "",
-    modelId: normalizeModeSettingValue(
-      state.latestModel,
-      ASSUMED_APP_DEFAULT_MODEL,
-    ),
-    reasoningEffort: normalizeModeSettingValue(
-      state.latestReasoningEffort,
-      ASSUMED_APP_DEFAULT_EFFORT,
-    ),
+    modelId: normalizeNullableModeValue(state.latestModel),
+    reasoningEffort: normalizeNullableModeValue(state.latestReasoningEffort),
   };
 }
 
@@ -863,6 +980,53 @@ function buildReadThreadSyncSignature(
     modeSelectionSignatureFromConversationState(conversationState),
     conversationProgressSignature(conversationState),
   ].join("|");
+}
+
+function selectPreferredConversationState(input: {
+  live: NonNullable<LiveStateResponse["conversationState"]> | null;
+  read: NonNullable<ReadThreadResponse["thread"]> | null;
+}): NonNullable<ReadThreadResponse["thread"]> | null {
+  if (input.live === null) {
+    return input.read;
+  }
+
+  if (input.read === null) {
+    return input.live;
+  }
+
+  const liveUpdatedAt = getConversationStateUpdatedAt(input.live);
+  const readUpdatedAt = getConversationStateUpdatedAt(input.read);
+  if (liveUpdatedAt >= readUpdatedAt) {
+    if (liveUpdatedAt > readUpdatedAt) {
+      return input.live;
+    }
+    return getConversationStateRichness(input.live) >=
+      getConversationStateRichness(input.read)
+      ? input.live
+      : input.read;
+  }
+
+  return input.read;
+}
+
+function selectPreferredRequestSourceState(input: {
+  live: NonNullable<LiveStateResponse["conversationState"]> | null;
+  read: NonNullable<ReadThreadResponse["thread"]> | null;
+}): NonNullable<ReadThreadResponse["thread"]> | null {
+  if (input.live === null || input.read === null) {
+    return selectPreferredConversationState(input);
+  }
+
+  const liveHasRequests = input.live.requests.length > 0;
+  const readHasRequests = input.read.requests.length > 0;
+  if (liveHasRequests && !readHasRequests) {
+    return input.live;
+  }
+  if (readHasRequests && !liveHasRequests) {
+    return input.read;
+  }
+
+  return selectPreferredConversationState(input);
 }
 
 function basenameFromPath(value: string): string {
@@ -1377,22 +1541,22 @@ export function App(): React.JSX.Element {
 
     return allGroups;
   }, [agentDescriptors, projectColors, sidebarOrder, threads]);
-  const conversationState = useMemo(() => {
-    const liveConversationState = liveState?.conversationState ?? null;
-    const readConversationState = readThreadState?.thread ?? null;
-    if (liveConversationState !== null) {
-      return liveConversationState;
-    }
-    return readConversationState;
-  }, [liveState?.conversationState, readThreadState?.thread]);
-  const requestSourceState = useMemo(() => {
-    const liveConversationState = liveState?.conversationState ?? null;
-    const readConversationState = readThreadState?.thread ?? null;
-    if (liveConversationState) {
-      return liveConversationState;
-    }
-    return readConversationState;
-  }, [liveState?.conversationState, readThreadState?.thread]);
+  const conversationState = useMemo(
+    () =>
+      selectPreferredConversationState({
+        live: liveState?.conversationState ?? null,
+        read: readThreadState?.thread ?? null,
+      }),
+    [liveState?.conversationState, readThreadState?.thread],
+  );
+  const requestSourceState = useMemo(
+    () =>
+      selectPreferredRequestSourceState({
+        live: liveState?.conversationState ?? null,
+        read: readThreadState?.thread ?? null,
+      }),
+    [liveState?.conversationState, readThreadState?.thread],
+  );
 
   const pendingRequests = useMemo(() => {
     if (!requestSourceState) return [] as PendingRequest[];
@@ -1546,6 +1710,30 @@ export function App(): React.JSX.Element {
   );
   const isPlanModeEnabled =
     planModeOption !== null && selectedModeKey === planModeOption.mode;
+  const activeModeKey = selectedModeKey || defaultModeOption?.mode || "";
+  const appDefaultModelId = useMemo(
+    () =>
+      resolveCollaborationModeModelId({
+        requestedModelId: "",
+        modeKey: activeModeKey,
+        modes,
+        models,
+        state: conversationState,
+      }),
+    [activeModeKey, conversationState, modes, models],
+  );
+  const appDefaultModelLabel = useMemo(() => {
+    if (appDefaultModelId.length === 0) {
+      return "Default model";
+    }
+    return buildModelOptionLabel(models, appDefaultModelId);
+  }, [appDefaultModelId, models]);
+  const selectedModelLabel = useMemo(() => {
+    if (selectedModelId.length > 0) {
+      return buildModelOptionLabel(models, selectedModelId);
+    }
+    return appDefaultModelLabel;
+  }, [appDefaultModelLabel, models, selectedModelId]);
 
   const effortOptions = useMemo(() => {
     const vals = new Set<string>(DEFAULT_EFFORT_OPTIONS);
@@ -1564,22 +1752,15 @@ export function App(): React.JSX.Element {
     selectedReasoningEffort,
   ]);
   const appDefaultEffortLabel = useMemo(() => {
-    const activeModeKey = selectedModeKey || defaultModeOption?.mode || "";
     const modeDefaultEffort = normalizeNullableModeValue(
-      modes.find((entry) => entry.mode === activeModeKey)?.reasoningEffort ??
-        null,
+      findModeDefinition(modes, activeModeKey)?.reasoningEffort ?? null,
     );
     if (modeDefaultEffort.length > 0) {
       return modeDefaultEffort;
     }
 
-    const activeModelId =
-      selectedModelId ||
-      normalizeNullableModeValue(conversationState?.latestModel) ||
-      models.find((entry) => entry.isDefault)?.id ||
-      "";
     const modelDefaultEffort = normalizeNullableModeValue(
-      models.find((entry) => entry.id === activeModelId)
+      models.find((entry) => entry.id === appDefaultModelId)
         ?.defaultReasoningEffort ?? null,
     );
     if (modelDefaultEffort.length > 0) {
@@ -1587,12 +1768,10 @@ export function App(): React.JSX.Element {
     }
     return ASSUMED_APP_DEFAULT_EFFORT;
   }, [
-    conversationState?.latestModel,
-    defaultModeOption?.mode,
+    activeModeKey,
+    appDefaultModelId,
     modes,
     models,
-    selectedModeKey,
-    selectedModelId,
   ]);
   const effortOptionsWithoutAppDefault = useMemo(
     () =>
@@ -1603,15 +1782,17 @@ export function App(): React.JSX.Element {
       ),
     [appDefaultEffortLabel, effortOptions, selectedReasoningEffort],
   );
+  const selectedReasoningEffortLabel = useMemo(() => {
+    if (selectedReasoningEffort.length > 0) {
+      return selectedReasoningEffort;
+    }
+    return appDefaultEffortLabel;
+  }, [appDefaultEffortLabel, selectedReasoningEffort]);
 
   const modelOptions = useMemo(() => {
     const map = new Map<string, string>();
     for (const m of models) {
-      const label =
-        m.displayName && m.displayName !== m.id
-          ? `${m.displayName} (${m.id})`
-          : m.displayName || m.id;
-      map.set(m.id, label);
+      map.set(m.id, buildModelOptionLabel(models, m.id));
     }
     const lm = conversationState?.latestModel;
     if (lm && !map.has(lm)) map.set(lm, lm);
@@ -1619,14 +1800,16 @@ export function App(): React.JSX.Element {
       map.set(selectedModelId, selectedModelId);
     return Array.from(map.entries()).map(([id, label]) => ({ id, label }));
   }, [conversationState?.latestModel, models, selectedModelId]);
-  const modelOptionsWithoutAssumedDefault = useMemo(
+  const modelOptionsWithoutAppDefault = useMemo(
     () =>
-      modelOptions.filter((option) => option.id !== ASSUMED_APP_DEFAULT_MODEL),
-    [modelOptions],
+      modelOptions.filter(
+        (option) =>
+          option.id !== appDefaultModelId || selectedModelId === option.id,
+      ),
+    [appDefaultModelId, modelOptions, selectedModelId],
   );
 
-  const deferredConversationState = useDeferredValue(conversationState);
-  const turns = deferredConversationState?.turns ?? [];
+  const turns = conversationState?.turns ?? [];
   const lastTurn = turns[turns.length - 1];
   const isGenerating = isTurnInProgressStatus(lastTurn?.status);
   const canUseComposer = isGenerating
@@ -1643,11 +1826,13 @@ export function App(): React.JSX.Element {
       turnIndex: number;
       turnIsInProgress: boolean;
     };
+    type IndexedConversationTurn = {
+      turnIndex: number;
+      entries: IndexedConversationItem[];
+    };
 
-    const newestFirst: IndexedConversationItem[] = [];
-    let hasHidden = false;
-
-    outer: for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const renderableTurns: IndexedConversationTurn[] = [];
+    for (let turnIndex = 0; turnIndex < turns.length; turnIndex += 1) {
       const turn = turns[turnIndex];
       if (!turn) {
         continue;
@@ -1656,40 +1841,64 @@ export function App(): React.JSX.Element {
       const isLastTurn = turnIndex === turns.length - 1;
       const turnInProgress = isLastTurn && isGenerating;
 
+      const entries: IndexedConversationItem[] = [];
       for (
-        let itemIndexInTurn = items.length - 1;
-        itemIndexInTurn >= 0;
-        itemIndexInTurn -= 1
+        let itemIndexInTurn = 0;
+        itemIndexInTurn < items.length;
+        itemIndexInTurn += 1
       ) {
         const item = items[itemIndexInTurn];
         if (!item || !shouldRenderConversationItem(item)) {
           continue;
         }
-        if (newestFirst.length >= visibleChatItemLimit) {
-          hasHidden = true;
-          break outer;
-        }
-        newestFirst.push({
+        entries.push({
           key: item.id ?? `${turnIndex}-${itemIndexInTurn}`,
           item,
           turnIndex,
           turnIsInProgress: turnInProgress,
         });
       }
+
+      if (entries.length > 0) {
+        renderableTurns.push({
+          turnIndex,
+          entries,
+        });
+      }
     }
 
-    const chronological = newestFirst.reverse();
-    const visibleItems: FlatConversationItem[] = chronological.map(
+    let startTurnIndex = renderableTurns.length;
+    let visibleCount = 0;
+    for (
+      let renderableTurnIndex = renderableTurns.length - 1;
+      renderableTurnIndex >= 0;
+      renderableTurnIndex -= 1
+    ) {
+      const renderableTurn = renderableTurns[renderableTurnIndex];
+      if (!renderableTurn) {
+        continue;
+      }
+      visibleCount += renderableTurn.entries.length;
+      startTurnIndex = renderableTurnIndex;
+      if (visibleCount >= visibleChatItemLimit) {
+        break;
+      }
+    }
+
+    const visibleEntries = renderableTurns
+      .slice(startTurnIndex)
+      .flatMap((renderableTurn) => renderableTurn.entries);
+    const visibleItems: FlatConversationItem[] = visibleEntries.map(
       (entry, index) => {
-        const previousEntry = chronological[index - 1];
-        const nextEntry = chronological[index + 1];
+        const previousEntry = visibleEntries[index - 1];
+        const nextEntry = visibleEntries[index + 1];
         const startsNewTurn = previousEntry?.turnIndex !== entry.turnIndex;
         const spacingTop = index === 0 ? 0 : startsNewTurn ? 16 : 10;
 
         return {
           key: entry.key,
           item: entry.item,
-          isLast: index === chronological.length - 1,
+          isLast: index === visibleEntries.length - 1,
           turnIsInProgress: entry.turnIsInProgress,
           previousItemType: previousEntry?.item.type,
           nextItemType: nextEntry?.item.type,
@@ -1699,7 +1908,7 @@ export function App(): React.JSX.Element {
     );
 
     return {
-      hasHidden,
+      hasHidden: startTurnIndex > 0,
       visibleItems,
     };
   }, [isGenerating, turns, visibleChatItemLimit]);
@@ -2114,17 +2323,57 @@ export function App(): React.JSX.Element {
     ) => {
       const includeTurns = options?.includeTurns ?? true;
       const includeStreamEvents = options?.includeStreamEvents ?? includeTurns;
-      let threadAgentId = threadProviderByIdRef.current.get(threadId) ?? null;
-      let read =
-        threadAgentId === null
-          ? await readThread(threadId, {
-              includeTurns,
-            })
-          : await readThread(threadId, {
-              includeTurns,
-              provider: threadAgentId,
-            });
-      threadAgentId = read.thread.provider;
+      const cachedThreadState =
+        threadViewStateCacheRef.current.get(threadId) ?? null;
+      const candidateProviders = collectThreadProviderCandidates({
+        threadId,
+        providerByThreadId: threadProviderByIdRef.current,
+        selectedThreadId: selectedThreadIdRef.current,
+        selectedThreadProvider:
+          selectedThreadIdRef.current === threadId
+            ? (selectedThread?.provider ?? null)
+            : null,
+        resolvedSelectedThreadProvider:
+          selectedThreadIdRef.current === threadId
+            ? resolvedSelectedThreadProvider
+            : null,
+        cachedThreadState,
+        readThreadState,
+        liveState,
+      });
+
+      let threadAgentId: AgentId | null = null;
+      let read: ReadThreadResponse | null = null;
+
+      for (const candidateProvider of candidateProviders) {
+        try {
+          read = await readThread(threadId, {
+            includeTurns,
+            provider: candidateProvider,
+          });
+          threadAgentId = read.thread.provider;
+          break;
+        } catch (error) {
+          if (
+            !(error instanceof ApiRequestError) ||
+            error.code !== "threadNotFound"
+          ) {
+            throw error;
+          }
+        }
+      }
+
+      if (!read) {
+        read = await readThread(threadId, {
+          includeTurns,
+        });
+        threadAgentId = read.thread.provider;
+      }
+
+      if (!threadAgentId) {
+        throw new Error(`Unable to load thread ${threadId}`);
+      }
+
       threadProviderByIdRef.current.set(threadId, threadAgentId);
 
       const descriptor = agentsById[threadAgentId];
@@ -2169,77 +2418,73 @@ export function App(): React.JSX.Element {
         (includeStreamEvents || threadAgentId === "codex");
       const shouldUpdateSelectedThread =
         selectedThreadIdRef.current === threadId;
-      const existingCachedState =
-        threadViewStateCacheRef.current.get(threadId) ?? null;
+      const existingCachedState = cachedThreadState;
       let nextStreamEvents = existingCachedState?.streamEvents ?? [];
-      startTransition(() => {
-        setThreads((previousThreads) => {
-          const nextIsGenerating = live.conversationState
-            ? isThreadGeneratingState(live.conversationState)
-            : isThreadGeneratingState(read.thread);
-          const nextThreads = previousThreads.map((threadSummary) => {
-            if (threadSummary.id !== read.thread.id) {
-              return threadSummary;
-            }
-
-            const nextUpdatedAt =
-              typeof read.thread.updatedAt === "number"
-                ? Math.max(threadSummary.updatedAt, read.thread.updatedAt)
-                : threadSummary.updatedAt;
-            const nextTitle =
-              read.thread.title !== undefined
-                ? read.thread.title
-                : threadSummary.title;
-            const hadGenerating = threadSummary.isGenerating ?? false;
-
-            if (
-              nextUpdatedAt === threadSummary.updatedAt &&
-              nextTitle === threadSummary.title &&
-              hadGenerating === nextIsGenerating
-            ) {
-              return threadSummary;
-            }
-
-            return {
-              ...threadSummary,
-              updatedAt: nextUpdatedAt,
-              isGenerating: nextIsGenerating,
-              ...(nextTitle !== undefined ? { title: nextTitle } : {}),
-            };
-          });
-
-          const sortedThreads = sortThreadsByRecency(nextThreads);
-          const nextSignature = buildThreadsSignature(sortedThreads);
-          if (signaturesMatch(threadsSignatureRef.current, nextSignature)) {
-            return previousThreads;
+      setThreads((previousThreads) => {
+        const nextIsGenerating = live.conversationState
+          ? isThreadGeneratingState(live.conversationState)
+          : isThreadGeneratingState(read.thread);
+        const nextThreads = previousThreads.map((threadSummary) => {
+          if (threadSummary.id !== read.thread.id) {
+            return threadSummary;
           }
-          threadsSignatureRef.current = nextSignature;
-          return sortedThreads;
-        });
-        if (!shouldUpdateSelectedThread) {
-          return;
-        }
-        setLiveState((prev) => {
+
+          const nextUpdatedAt =
+            typeof read.thread.updatedAt === "number"
+              ? Math.max(threadSummary.updatedAt, read.thread.updatedAt)
+              : threadSummary.updatedAt;
+          const nextTitle =
+            read.thread.title !== undefined
+              ? read.thread.title
+              : threadSummary.title;
+          const hadGenerating = threadSummary.isGenerating ?? false;
+
           if (
-            buildLiveStateSyncSignature(prev) ===
-            buildLiveStateSyncSignature(live)
+            nextUpdatedAt === threadSummary.updatedAt &&
+            nextTitle === threadSummary.title &&
+            hadGenerating === nextIsGenerating
+          ) {
+            return threadSummary;
+          }
+
+          return {
+            ...threadSummary,
+            updatedAt: nextUpdatedAt,
+            isGenerating: nextIsGenerating,
+            ...(nextTitle !== undefined ? { title: nextTitle } : {}),
+          };
+        });
+
+        const sortedThreads = sortThreadsByRecency(nextThreads);
+        const nextSignature = buildThreadsSignature(sortedThreads);
+        if (signaturesMatch(threadsSignatureRef.current, nextSignature)) {
+          return previousThreads;
+        }
+        threadsSignatureRef.current = nextSignature;
+        return sortedThreads;
+      });
+      if (!shouldUpdateSelectedThread) {
+        return;
+      }
+      setLiveState((prev) => {
+        if (
+          buildLiveStateSyncSignature(prev) === buildLiveStateSyncSignature(live)
+        ) {
+          return prev;
+        }
+        return live;
+      });
+      if (shouldReadTurns) {
+        setReadThreadState((prev) => {
+          if (
+            buildReadThreadSyncSignature(prev) ===
+            buildReadThreadSyncSignature(read)
           ) {
             return prev;
           }
-          return live;
+          return read;
         });
-        if (shouldReadTurns) {
-          setReadThreadState((prev) => {
-            if (
-              buildReadThreadSyncSignature(prev) ===
-              buildReadThreadSyncSignature(read)
-            ) {
-              return prev;
-            }
-            return read;
-          });
-        }
-      });
+      }
 
       threadViewStateCacheRef.current.set(threadId, {
         readThreadState: shouldReadTurns
@@ -2265,23 +2510,27 @@ export function App(): React.JSX.Element {
       if (selectedThreadIdRef.current !== threadId) {
         return;
       }
-      startTransition(() => {
-        setStreamEvents((prev) => {
-          const prevLast = prev[prev.length - 1];
-          const nextLast = stream.events[stream.events.length - 1];
-          const prevLastSignature = prevLast ? JSON.stringify(prevLast) : "";
-          const nextLastSignature = nextLast ? JSON.stringify(nextLast) : "";
-          if (
-            prev.length === stream.events.length &&
-            prevLastSignature === nextLastSignature
-          ) {
-            return prev;
-          }
-          return stream.events;
-        });
+      setStreamEvents((prev) => {
+        const prevLast = prev[prev.length - 1];
+        const nextLast = stream.events[stream.events.length - 1];
+        const prevLastSignature = prevLast ? JSON.stringify(prevLast) : "";
+        const nextLastSignature = nextLast ? JSON.stringify(nextLast) : "";
+        if (
+          prev.length === stream.events.length &&
+          prevLastSignature === nextLastSignature
+        ) {
+          return prev;
+        }
+        return stream.events;
       });
     },
-    [agentsById],
+    [
+      agentsById,
+      liveState,
+      readThreadState,
+      resolvedSelectedThreadProvider,
+      selectedThread?.provider,
+    ],
   );
 
   const refreshAll = useCallback(async () => {
@@ -2502,11 +2751,9 @@ export function App(): React.JSX.Element {
         return;
       }
 
-      startTransition(() => {
-        setReadThreadState(nextReadThreadState);
-        setLiveState(nextLiveState);
-        setStreamEvents(nextStreamEvents);
-      });
+      setReadThreadState(nextReadThreadState);
+      setLiveState(nextLiveState);
+      setStreamEvents(nextStreamEvents);
     },
     [],
   );
@@ -2638,6 +2885,110 @@ export function App(): React.JSX.Element {
     }
     void loadCore().catch((error) => setError(toErrorMessage(error)));
   }, [selectedAgentId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const activeDescriptor = agentsById[activeThreadAgentId] ?? null;
+    const canLoadModes = canUseFeature(
+      activeDescriptor,
+      "listCollaborationModes",
+    );
+    const canLoadModels = canUseFeature(activeDescriptor, "listModels");
+    const cachedCatalog =
+      providerCatalogCacheRef.current.get(activeThreadAgentId) ?? null;
+    const now = Date.now();
+    const shouldLoadCatalog =
+      !cachedCatalog ||
+      now - cachedCatalog.fetchedAt >= PROVIDER_CATALOG_CACHE_TTL_MS;
+
+    const applyCatalog = (
+      nextModesData: ModesResponse["data"],
+      nextModelsData: ModelsResponse["data"],
+    ): void => {
+      if (cancelled) {
+        return;
+      }
+
+      const nextModesSignature = nextModesData.map((mode) =>
+        [mode.mode, mode.name, mode.reasoningEffort ?? ""].join("|"),
+      );
+      const nextModelsSignature = nextModelsData.map((model) =>
+        [model.id, model.displayName ?? ""].join("|"),
+      );
+
+      startTransition(() => {
+        if (!signaturesMatch(modesSignatureRef.current, nextModesSignature)) {
+          modesSignatureRef.current = nextModesSignature;
+          setModes(nextModesData);
+        }
+        if (!signaturesMatch(modelsSignatureRef.current, nextModelsSignature)) {
+          modelsSignatureRef.current = nextModelsSignature;
+          setModels(nextModelsData);
+        }
+        setSelectedModeKey((cur) => {
+          if (cur || nextModesData.length === 0) {
+            return cur;
+          }
+          const nonPlanDefault = nextModesData.find(
+            (mode) => !isPlanModeOption(mode),
+          );
+          return nonPlanDefault?.mode ?? nextModesData[0]?.mode ?? "";
+        });
+      });
+    };
+
+    if (!canLoadModes && !canLoadModels) {
+      applyCatalog([], []);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (cachedCatalog && !shouldLoadCatalog) {
+      applyCatalog(
+        canLoadModes ? cachedCatalog.modes : [],
+        canLoadModels ? cachedCatalog.models : [],
+      );
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    void (async () => {
+      try {
+        const [nextModesResult, nextModelsResult] = await Promise.all([
+          canLoadModes
+            ? listCollaborationModes(activeThreadAgentId)
+            : Promise.resolve({ data: [] as ModesResponse["data"] }),
+          canLoadModels
+            ? listModels(activeThreadAgentId)
+            : Promise.resolve({ data: [] as ModelsResponse["data"] }),
+        ]);
+
+        if (cancelled) {
+          return;
+        }
+
+        providerCatalogCacheRef.current.set(activeThreadAgentId, {
+          modes: nextModesResult.data,
+          models: nextModelsResult.data,
+          fetchedAt: Date.now(),
+        });
+        applyCatalog(nextModesResult.data, nextModelsResult.data);
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
+        console.error("Failed to load active provider model catalog", error);
+        setError(toErrorMessage(error));
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeThreadAgentId, agentsById]);
 
 
   useEffect(() => {
@@ -2974,6 +3325,9 @@ export function App(): React.JSX.Element {
 
         let threadId = selectedThreadId;
         let threadAgentId = activeThreadAgentId;
+        let threadConversationStateForSend:
+          | NonNullable<ReadThreadResponse["thread"]>
+          | null = conversationState;
 
         // Auto-create a thread if none is selected.
         if (!threadId) {
@@ -2993,14 +3347,50 @@ export function App(): React.JSX.Element {
           );
           setSelectedThreadId(threadId);
           selectedThreadIdRef.current = threadId;
+          threadConversationStateForSend = created.thread;
         }
 
+        const selectedMode =
+          modes.find((entry) => entry.mode === selectedModeKey) ?? null;
+        const effectiveModelId = resolveCollaborationModeModelId({
+          requestedModelId: selectedModelId,
+          modeKey: selectedMode?.mode ?? selectedModeKey,
+          modes,
+          models,
+          state: threadConversationStateForSend,
+        });
+        if (selectedMode && effectiveModelId.length === 0) {
+          throw new Error("No model is available for the selected mode");
+        }
         await sendMessage({
           provider: threadAgentId,
           threadId,
           text: draft,
           ...(liveState?.ownerClientId
             ? { ownerClientId: liveState.ownerClientId }
+            : {}),
+          ...(effectiveModelId ? { model: effectiveModelId } : {}),
+          ...(selectedReasoningEffort
+            ? { effort: selectedReasoningEffort }
+            : {}),
+          ...(selectedMode
+            ? {
+                collaborationMode: {
+                  mode: selectedMode.mode,
+                  settings: {
+                    model: effectiveModelId,
+                    ...(selectedReasoningEffort
+                      ? { reasoningEffort: selectedReasoningEffort }
+                      : {}),
+                    ...(selectedMode.developerInstructions
+                      ? {
+                          developerInstructions:
+                            selectedMode.developerInstructions
+                        }
+                      : {})
+                  }
+                }
+              }
             : {}),
         });
         await refreshAll();
@@ -3013,10 +3403,16 @@ export function App(): React.JSX.Element {
     [
       activeThreadAgentId,
       canSendMessageForActiveAgent,
+      conversationState,
       hasResolvedSelectedThreadProvider,
       liveState?.ownerClientId,
+      models,
+      modes,
       refreshAll,
       selectedAgentId,
+      selectedModeKey,
+      selectedModelId,
+      selectedReasoningEffort,
       selectedThreadId,
       upsertSidebarThread,
     ],
@@ -3055,6 +3451,16 @@ export function App(): React.JSX.Element {
       setIsModeSyncing(true);
       try {
         setError("");
+        const collaborationModeModelId = resolveCollaborationModeModelId({
+          requestedModelId: draft.modelId,
+          modeKey: draft.modeKey,
+          modes,
+          models,
+          state: conversationState,
+        });
+        if (collaborationModeModelId.length === 0) {
+          throw new Error("No model is available for the selected mode");
+        }
         await setCollaborationMode({
           provider: activeThreadAgentId,
           threadId: selectedThreadId,
@@ -3064,7 +3470,7 @@ export function App(): React.JSX.Element {
           collaborationMode: {
             mode: mode.mode,
             settings: {
-              model: draft.modelId || null,
+              model: collaborationModeModelId,
               reasoningEffort: draft.reasoningEffort || null,
               developerInstructions: mode.developerInstructions ?? null,
             },
@@ -3083,10 +3489,12 @@ export function App(): React.JSX.Element {
     },
     [
       activeThreadAgentId,
+      conversationState,
       hasResolvedSelectedThreadProvider,
       isModeSyncing,
       liveState?.ownerClientId,
       loadSelectedThread,
+      models,
       modes,
       selectedThreadId,
     ],
@@ -3931,6 +4339,24 @@ export function App(): React.JSX.Element {
                   <div>
                     Init: {health?.state.ipcInitialized ? "ready" : "not ready"}
                   </div>
+                  <div>
+                    Core build:{" "}
+                    {formatTimingSummary(
+                      health?.state.timings?.realtimeCoreBuild,
+                    )}
+                  </div>
+                  <div>
+                    Thread build:{" "}
+                    {formatTimingSummary(
+                      health?.state.timings?.realtimeThreadBuild,
+                    )}
+                  </div>
+                  <div>
+                    Thread refresh:{" "}
+                    {formatTimingSummary(
+                      health?.state.timings?.codexThreadRefresh,
+                    )}
+                  </div>
                 </>
               ) : null}
               {health?.state.lastError && (
@@ -4468,6 +4894,7 @@ export function App(): React.JSX.Element {
                               )}
                             {canSetCollaborationMode && canListModels && (
                               <Select
+                                key={`model:${selectedThreadId ?? "none"}:${appDefaultModelLabel}`}
                                 value={selectedModelId || APP_DEFAULT_VALUE}
                                 onValueChange={(value) => {
                                   const nextModelId =
@@ -4482,13 +4909,15 @@ export function App(): React.JSX.Element {
                                 disabled={!selectedThreadId || !selectedModeKey}
                               >
                                 <SelectTrigger className="h-8 w-[132px] sm:w-[176px] shrink-0 rounded-full border-0 bg-transparent dark:bg-transparent px-2 text-xs text-muted-foreground shadow-none hover:text-foreground focus-visible:ring-0">
-                                  <SelectValue placeholder="Model" />
+                                  <SelectValue placeholder="Model">
+                                    {selectedModelLabel}
+                                  </SelectValue>
                                 </SelectTrigger>
                                 <SelectContent position="popper">
                                   <SelectItem value={APP_DEFAULT_VALUE}>
-                                    {ASSUMED_APP_DEFAULT_MODEL}
+                                    {appDefaultModelLabel}
                                   </SelectItem>
-                                  {modelOptionsWithoutAssumedDefault.map(
+                                  {modelOptionsWithoutAppDefault.map(
                                     (option) => (
                                       <SelectItem
                                         key={option.id}
@@ -4504,6 +4933,7 @@ export function App(): React.JSX.Element {
                             {canSetCollaborationMode &&
                               canListCollaborationModes && (
                                 <Select
+                                  key={`effort:${selectedThreadId ?? "none"}:${appDefaultEffortLabel}`}
                                   value={
                                     selectedReasoningEffort || APP_DEFAULT_VALUE
                                   }
@@ -4524,7 +4954,9 @@ export function App(): React.JSX.Element {
                                   }
                                 >
                                   <SelectTrigger className="h-8 w-[104px] sm:w-[148px] shrink-0 rounded-full border-0 bg-transparent dark:bg-transparent px-2 text-xs text-muted-foreground shadow-none hover:text-foreground focus-visible:ring-0">
-                                    <SelectValue placeholder="Effort" />
+                                    <SelectValue placeholder="Effort">
+                                      {selectedReasoningEffortLabel}
+                                    </SelectValue>
                                   </SelectTrigger>
                                   <SelectContent position="popper">
                                     <SelectItem value={APP_DEFAULT_VALUE}>

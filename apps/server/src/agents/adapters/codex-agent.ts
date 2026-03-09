@@ -2,31 +2,37 @@ import {
   AppServerClient,
   AppServerRpcError,
   AppServerTransportError,
-  CodexMonitorService,
+  applyStrictPatch,
   DesktopIpcError,
   DesktopIpcClient,
-  reduceThreadStreamEvents,
-  ThreadStreamReductionError,
   type SendRequestOptions,
 } from "@farfield/api";
 import {
+  type AppServerServerNotification,
+  type AppServerServerRequest,
+  JsonValueSchema,
   ProtocolValidationError,
-  parseCommandExecutionRequestApprovalResponse,
-  parseFileChangeRequestApprovalResponse,
-  parseToolRequestUserInputResponsePayload,
+  ContextCompactionItemSchema,
+  ErrorItemSchema,
+  ModelChangedItemSchema,
   parseThreadConversationState,
   parseThreadStreamStateChangedBroadcast,
   parseUserInputResponsePayload,
   type IpcFrame,
   type IpcRequestFrame,
   type IpcResponseFrame,
+  ThreadStatusSchema,
+  ThreadConversationRequestSchema,
+  ThreadTurnSchema,
+  TodoListItemSchema,
+  TurnItemSchema,
   type ThreadConversationRequest,
   type ThreadConversationState,
   type ThreadStreamStateChangedBroadcast,
   type UserInputRequestId,
 } from "@farfield/protocol";
+import { z } from "zod";
 import { logger } from "../../logger.js";
-import { resolveOwnerClientId } from "../../thread-owner.js";
 import type {
   AgentAdapter,
   AgentCapabilities,
@@ -42,9 +48,18 @@ import type {
   AgentSubmitUserInputInput,
   AgentThreadLiveState,
   AgentThreadStreamEvents,
+  AgentTurnCollaborationMode,
 } from "../types.js";
 
 type StreamSnapshotOrigin = "stream" | "readThreadWithTurns" | "readThread";
+type ThreadTurn = z.infer<typeof ThreadTurnSchema>;
+type TurnItem = z.infer<typeof TurnItemSchema>;
+
+interface PendingThreadRefresh {
+  sourceClientId: string | null;
+  origin: StreamSnapshotOrigin;
+  delayMs: number;
+}
 
 export interface CodexAgentRuntimeState {
   appReady: boolean;
@@ -61,16 +76,29 @@ export interface CodexIpcFrameEvent {
   threadId: string | null;
 }
 
+export interface CodexAppFrameEvent {
+  direction: "in";
+  kind: "notification" | "request";
+  frame: AppServerServerNotification | AppServerServerRequest;
+  method: string;
+  threadId: string | null;
+}
+
 export interface CodexAgentOptions {
   appExecutable: string;
   socketPath: string;
   workspaceDir: string;
   userAgent: string;
   reconnectDelayMs: number;
-  onStateChange?: () => void;
+  onRuntimeStateChange?: () => void;
+  onThreadStateChange?: (threadId: string) => void;
+  onTiming?: (metricId: "codexThreadRefresh" | "codexLiveStateRead", durationMs: number) => void;
 }
 
 const ANSI_ESCAPE_REGEX = /\u001B\[[0-?]*[ -/]*[@-~]/g;
+const APP_SERVER_THREAD_REFRESH_DEBOUNCE_MS = 120;
+const IPC_THREAD_REFRESH_DEBOUNCE_MS = 1_500;
+const THREAD_REFRESH_RETRY_DELAY_MS = 600;
 
 export class CodexAgentAdapter implements AgentAdapter {
   public readonly id = "codex";
@@ -87,12 +115,20 @@ export class CodexAgentAdapter implements AgentAdapter {
 
   private readonly appClient: AppServerClient;
   private readonly ipcClient: DesktopIpcClient;
-  private readonly service: CodexMonitorService;
-  private readonly onStateChange: (() => void) | null;
+  private readonly onRuntimeStateChange: (() => void) | null;
+  private readonly onThreadStateChange: ((threadId: string) => void) | null;
+  private readonly onTiming:
+    | ((metricId: "codexThreadRefresh" | "codexLiveStateRead", durationMs: number) => void)
+    | null;
   private readonly reconnectDelayMs: number;
 
   private readonly threadOwnerById = new Map<string, string>();
   private readonly streamEventsByThreadId = new Map<string, IpcFrame[]>();
+  private readonly activeTurnIdByThreadId = new Map<string, string>();
+  private readonly pendingCollaborationModeByThreadId = new Map<
+    string,
+    AgentTurnCollaborationMode
+  >();
   private readonly streamSnapshotByThreadId = new Map<
     string,
     ThreadConversationState
@@ -101,10 +137,36 @@ export class CodexAgentAdapter implements AgentAdapter {
     string,
     StreamSnapshotOrigin
   >();
+  private readonly streamPatchSyncDisabledThreadIds = new Set<string>();
   private readonly threadTitleById = new Map<string, string | null>();
+  private readonly liveStateErrorByThreadId = new Map<
+    string,
+    AgentThreadLiveState["liveStateError"]
+  >();
   private readonly ipcFrameListeners = new Set<
     (event: CodexIpcFrameEvent) => void
   >();
+  private readonly appFrameListeners = new Set<
+    (event: CodexAppFrameEvent) => void
+  >();
+  private readonly pendingThreadRefreshByThreadId = new Map<
+    string,
+    PendingThreadRefresh
+  >();
+  private readonly pendingThreadRefreshTimers = new Map<
+    string,
+    NodeJS.Timeout
+  >();
+  private readonly pendingOwnerBroadcastByThreadId = new Map<
+    string,
+    {
+      thread: ThreadConversationState;
+      ownerClientId: string | null;
+    }
+  >();
+  private readonly pendingOwnerBroadcastTimers = new Map<string, NodeJS.Timeout>();
+  private readonly threadRefreshesInFlight = new Set<string>();
+  private ipcClientId: string | null = null;
   private lastKnownOwnerClientId: string | null = null;
 
   private runtimeState: CodexAgentRuntimeState = {
@@ -120,13 +182,16 @@ export class CodexAgentAdapter implements AgentAdapter {
   private started = false;
 
   public constructor(options: CodexAgentOptions) {
-    this.onStateChange = options.onStateChange ?? null;
+    this.onRuntimeStateChange = options.onRuntimeStateChange ?? null;
+    this.onThreadStateChange = options.onThreadStateChange ?? null;
+    this.onTiming = options.onTiming ?? null;
     this.reconnectDelayMs = options.reconnectDelayMs;
 
     this.appClient = new AppServerClient({
       executablePath: options.appExecutable,
       userAgent: options.userAgent,
       cwd: options.workspaceDir,
+      experimentalApi: true,
       onStderr: (line) => {
         const normalized = normalizeStderrLine(line);
         logger.error({ line: normalized }, "codex-app-server-stderr");
@@ -136,9 +201,11 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.ipcClient = new DesktopIpcClient({
       socketPath: options.socketPath,
     });
-    this.service = new CodexMonitorService(this.ipcClient);
 
     this.ipcClient.onConnectionState((state) => {
+      if (!state.connected) {
+        this.ipcClientId = null;
+      }
       this.patchRuntimeState({
         ipcConnected: state.connected,
         ipcInitialized: state.connected
@@ -170,6 +237,11 @@ export class CodexAgentAdapter implements AgentAdapter {
           : undefined;
       const sourceClientId =
         typeof sourceClientIdRaw === "string" ? sourceClientIdRaw.trim() : "";
+      const isSelfOriginatedBroadcast =
+        frame.type === "broadcast" &&
+        sourceClientId.length > 0 &&
+        this.ipcClientId !== null &&
+        sourceClientId === this.ipcClientId;
       if (sourceClientId) {
         this.lastKnownOwnerClientId = sourceClientId;
       }
@@ -182,59 +254,43 @@ export class CodexAgentAdapter implements AgentAdapter {
       });
 
       if (frame.type === "broadcast" && threadId) {
-        const current = this.streamEventsByThreadId.get(threadId) ?? [];
-        current.push(frame);
-        if (current.length > 400) {
-          current.splice(0, current.length - 400);
+        if (sourceClientId && !isSelfOriginatedBroadcast) {
+          this.threadOwnerById.set(threadId, sourceClientId);
         }
-        this.streamEventsByThreadId.set(threadId, current);
       }
 
-      if (
-        frame.type !== "broadcast" ||
-        frame.method !== "thread-stream-state-changed"
-      ) {
+      if (frame.type !== "broadcast") {
         return;
       }
 
-      const params = frame.params;
-      if (!params || typeof params !== "object") {
+      if (frame.method !== "thread-stream-state-changed" || !threadId) {
         return;
       }
 
-      const conversationId = (params as Record<string, string>)[
-        "conversationId"
-      ];
-      if (!conversationId || !conversationId.trim()) {
+      if (isSelfOriginatedBroadcast) {
         return;
       }
 
-      if (sourceClientId) {
-        this.threadOwnerById.set(conversationId, sourceClientId);
-      }
-
-      try {
-        const parsedBroadcast = parseThreadStreamStateChangedBroadcast(frame);
-        if (parsedBroadcast.params.change.type !== "snapshot") {
-          return;
-        }
-
-        const snapshot = parsedBroadcast.params.change.conversationState;
-        this.streamSnapshotByThreadId.set(conversationId, snapshot);
-        this.streamSnapshotOriginByThreadId.set(conversationId, "stream");
-        this.setThreadTitle(conversationId, snapshot.title);
-      } catch (error) {
-        logger.error(
-          {
-            conversationId,
-            error: toErrorMessage(error),
-            ...(error instanceof ProtocolValidationError
-              ? { issues: error.issues }
-              : {}),
-          },
-          "thread-stream-broadcast-parse-failed",
+      const shouldRefresh = this.recordThreadStreamEvent(
+        frame,
+        threadId,
+        sourceClientId || null,
+      );
+      if (shouldRefresh) {
+        this.scheduleThreadRefresh(
+          threadId,
+          sourceClientId || null,
+          "readThreadWithTurns",
+          IPC_THREAD_REFRESH_DEBOUNCE_MS,
         );
       }
+    });
+
+    this.appClient.onServerNotification((notification) => {
+      void this.handleServerNotification(notification);
+    });
+    this.appClient.onServerRequest((request) => {
+      void this.handleServerRequest(request);
     });
   }
 
@@ -242,6 +298,13 @@ export class CodexAgentAdapter implements AgentAdapter {
     this.ipcFrameListeners.add(listener);
     return () => {
       this.ipcFrameListeners.delete(listener);
+    };
+  }
+
+  public onAppFrame(listener: (event: CodexAppFrameEvent) => void): () => void {
+    this.appFrameListeners.add(listener);
+    return () => {
+      this.appFrameListeners.delete(listener);
     };
   }
 
@@ -277,6 +340,17 @@ export class CodexAgentAdapter implements AgentAdapter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    for (const timer of this.pendingThreadRefreshTimers.values()) {
+      clearTimeout(timer);
+    }
+    for (const timer of this.pendingOwnerBroadcastTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.pendingThreadRefreshByThreadId.clear();
+    this.pendingThreadRefreshTimers.clear();
+    this.pendingOwnerBroadcastByThreadId.clear();
+    this.pendingOwnerBroadcastTimers.clear();
+    this.threadRefreshesInFlight.clear();
 
     await this.ipcClient.disconnect();
     await this.appClient.close();
@@ -447,23 +521,30 @@ export class CodexAgentAdapter implements AgentAdapter {
         result = await readThreadWithOption(false);
       }
     }
-    const parsedThread = parseThreadConversationState(result.thread);
+    const parsedThread = this.applyPendingCollaborationMode(
+      parseThreadConversationState(result.thread),
+    );
     const existingSnapshot = this.streamSnapshotByThreadId.get(input.threadId);
     const shouldStoreSnapshot =
       input.includeTurns ||
       parsedThread.turns.length > 0 ||
       existingSnapshot === undefined;
+    let returnedThread = parsedThread;
     if (shouldStoreSnapshot) {
-      this.streamSnapshotByThreadId.set(input.threadId, parsedThread);
       const snapshotOrigin: StreamSnapshotOrigin =
         input.includeTurns && parsedThread.turns.length > 0
           ? "readThreadWithTurns"
           : "readThread";
-      this.streamSnapshotOriginByThreadId.set(input.threadId, snapshotOrigin);
+      returnedThread = this.storeThreadSnapshot(
+        input.threadId,
+        parsedThread,
+        snapshotOrigin,
+        this.resolveVisibleOwnerClientId(input.threadId),
+        false,
+      );
     }
-    this.setThreadTitle(input.threadId, parsedThread.title);
     return {
-      thread: parsedThread,
+      thread: returnedThread,
     };
   }
 
@@ -473,55 +554,12 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (text.length === 0) {
       throw new Error("Message text is required");
     }
-
-    const ownerClientId = (() => {
-      const mapped = this.threadOwnerById.get(input.threadId);
-      if (mapped && mapped.trim().length > 0) {
-        return mapped.trim();
-      }
-      if (input.ownerClientId && input.ownerClientId.trim().length > 0) {
-        return input.ownerClientId.trim();
-      }
-      if (this.lastKnownOwnerClientId && this.lastKnownOwnerClientId.trim()) {
-        return this.lastKnownOwnerClientId.trim();
-      }
-      return null;
-    })();
-
-    if (ownerClientId && this.isIpcReady()) {
-      this.threadOwnerById.set(input.threadId, ownerClientId);
-      try {
-        await this.service.sendMessage({
-          threadId: input.threadId,
-          ownerClientId,
-          text,
-          ...(input.cwd ? { cwd: input.cwd } : {}),
-          ...(typeof input.isSteering === "boolean"
-            ? { isSteering: input.isSteering }
-            : {}),
-        });
-        return;
-      } catch (error) {
-        const typedError = error instanceof Error ? error : null;
-        if (!isIpcNoClientFoundError(typedError)) {
-          throw error;
-        }
-        const mappedOwnerClientId = this.threadOwnerById.get(input.threadId);
-        if (mappedOwnerClientId === ownerClientId) {
-          this.threadOwnerById.delete(input.threadId);
-        }
-        if (this.lastKnownOwnerClientId === ownerClientId) {
-          this.lastKnownOwnerClientId = null;
-        }
-        logger.info(
-          {
-            threadId: input.threadId,
-            ownerClientId,
-            error: toErrorMessage(error),
-          },
-          "thread-owner-unreachable-send-via-app-server",
-        );
-      }
+    const visibleOwnerClientId = this.resolveVisibleOwnerClientId(
+      input.threadId,
+      input.ownerClientId,
+    );
+    if (visibleOwnerClientId) {
+      this.threadOwnerById.set(input.threadId, visibleOwnerClientId);
     }
 
     const sendTurn = async (): Promise<void> => {
@@ -539,14 +577,41 @@ export class CodexAgentAdapter implements AgentAdapter {
         return;
       }
 
+      const pendingCollaborationMode =
+        input.collaborationMode !== undefined
+          ? input.collaborationMode
+          : this.pendingCollaborationModeByThreadId.get(input.threadId);
+      if (pendingCollaborationMode === null) {
+        this.pendingCollaborationModeByThreadId.delete(input.threadId);
+      } else if (pendingCollaborationMode !== undefined) {
+        this.pendingCollaborationModeByThreadId.set(
+          input.threadId,
+          pendingCollaborationMode,
+        );
+      }
+      const resolvedModel = await this.resolveTurnModelId(
+        input.threadId,
+        input.model,
+        pendingCollaborationMode,
+      );
       await this.appClient.startTurn({
         threadId: input.threadId,
         input: [{ type: "text", text }],
         ...(input.cwd ? { cwd: input.cwd } : {}),
+        model: resolvedModel,
+        ...(input.effort ? { effort: input.effort } : {}),
+        ...(pendingCollaborationMode !== undefined
+          ? { collaborationMode: pendingCollaborationMode }
+          : {}),
         attachments: [],
       });
     };
     await this.runThreadOperationWithResumeRetry(input.threadId, sendTurn);
+    await this.refreshThreadFromAppServer(
+      input.threadId,
+      visibleOwnerClientId,
+      "readThreadWithTurns",
+    );
   }
 
   public async interrupt(input: AgentInterruptInput): Promise<void> {
@@ -583,23 +648,32 @@ export class CodexAgentAdapter implements AgentAdapter {
     input: AgentSetCollaborationModeInput,
   ): Promise<{ ownerClientId: string }> {
     this.ensureCodexAvailable();
-    this.ensureIpcReady();
-
-    const ownerClientId = resolveOwnerClientId(
-      this.threadOwnerById,
+    this.pendingCollaborationModeByThreadId.set(
       input.threadId,
-      input.ownerClientId,
-      this.lastKnownOwnerClientId ?? undefined,
+      input.collaborationMode,
     );
 
-    await this.service.setCollaborationMode({
-      threadId: input.threadId,
-      ownerClientId,
-      collaborationMode: input.collaborationMode,
-    });
+    const currentSnapshot = this.streamSnapshotByThreadId.get(input.threadId);
+    if (currentSnapshot) {
+      const nextSnapshot = this.applyPendingCollaborationMode(currentSnapshot);
+      this.storeThreadSnapshot(
+        input.threadId,
+        nextSnapshot,
+        this.streamSnapshotOriginByThreadId.get(input.threadId) ?? "readThread",
+        this.resolveVisibleOwnerClientId(input.threadId, input.ownerClientId),
+        true,
+      );
+      this.broadcastThreadSnapshotToOwner(
+        input.threadId,
+        nextSnapshot,
+        this.resolveVisibleOwnerClientId(input.threadId, input.ownerClientId),
+      );
+    }
 
     return {
-      ownerClientId,
+      ownerClientId:
+        this.resolveVisibleOwnerClientId(input.threadId, input.ownerClientId) ??
+        "farfield",
     };
   }
 
@@ -608,244 +682,56 @@ export class CodexAgentAdapter implements AgentAdapter {
   ): Promise<{ ownerClientId: string; requestId: UserInputRequestId }> {
     this.ensureCodexAvailable();
     const parsedResponse = parseUserInputResponsePayload(input.response);
-    const ownerClientIdForResult = (() => {
-      const mapped = this.threadOwnerById.get(input.threadId);
-      if (mapped && mapped.trim().length > 0) {
-        return mapped.trim();
-      }
-      if (input.ownerClientId && input.ownerClientId.trim().length > 0) {
-        return input.ownerClientId.trim();
-      }
-      if (this.lastKnownOwnerClientId && this.lastKnownOwnerClientId.trim()) {
-        return this.lastKnownOwnerClientId.trim();
-      }
-      return "app-server";
-    })();
+    const ownerClientIdForResult =
+      this.resolveVisibleOwnerClientId(input.threadId, input.ownerClientId) ??
+      "app-server";
 
-    const threadForRouting = await this.runThreadOperationWithResumeRetry(
+    const threadForRequest = await this.runThreadOperationWithResumeRetry(
       input.threadId,
       () => this.appClient.readThread(input.threadId, false),
     );
-    const parsedRoutingThread = parseThreadConversationState(threadForRouting.thread);
-    const routingPendingRequest = findPendingRequestWithId(
-      parsedRoutingThread,
+    const parsedThreadForRequest = this.applyPendingCollaborationMode(
+      parseThreadConversationState(threadForRequest.thread),
+    );
+    const pendingRequest = findPendingRequestWithId(
+      parsedThreadForRequest,
       input.requestId,
     );
 
-    if (routingPendingRequest) {
-      await this.runAppServerCall(() =>
-        this.appClient.submitUserInput(input.requestId, parsedResponse),
+    if (!pendingRequest) {
+      throw new Error(
+        `Pending request ${String(input.requestId)} is not present in app-server thread state for thread ${input.threadId}`,
       );
-
-      const refreshedThread = await this.runThreadOperationWithResumeRetry(
-        input.threadId,
-        () => this.appClient.readThread(input.threadId, true),
-      );
-      const parsedThread = parseThreadConversationState(refreshedThread.thread);
-      this.streamSnapshotByThreadId.set(input.threadId, parsedThread);
-      this.streamSnapshotOriginByThreadId.set(input.threadId, "readThreadWithTurns");
-      this.setThreadTitle(input.threadId, parsedThread.title);
-
-      const currentEvents = this.streamEventsByThreadId.get(input.threadId) ?? [];
-      currentEvents.push(
-        buildSyntheticSnapshotEvent(input.threadId, ownerClientIdForResult, parsedThread),
-      );
-      if (currentEvents.length > 400) {
-        currentEvents.splice(0, currentEvents.length - 400);
-      }
-      this.streamEventsByThreadId.set(input.threadId, currentEvents);
-
-      return {
-        ownerClientId: ownerClientIdForResult,
-        requestId: input.requestId,
-      };
     }
 
-    this.ensureIpcReady();
-    const ownerClientId = resolveOwnerClientId(
-      this.threadOwnerById,
-      input.threadId,
-      input.ownerClientId,
-      this.lastKnownOwnerClientId ?? undefined,
+    await this.runAppServerCall(() =>
+      this.appClient.submitUserInput(input.requestId, parsedResponse),
     );
-    this.threadOwnerById.set(input.threadId, ownerClientId);
-
-    const pendingIpcRequest = await this.resolvePendingIpcRequest(
+    await this.refreshThreadFromAppServer(
       input.threadId,
-      input.requestId,
+      ownerClientIdForResult,
+      "readThreadWithTurns",
     );
-    switch (pendingIpcRequest.method) {
-      case "item/commandExecution/requestApproval": {
-        const commandResponse =
-          parseCommandExecutionRequestApprovalResponse(parsedResponse);
-        await this.service.submitCommandApprovalDecision({
-          threadId: input.threadId,
-          ownerClientId,
-          requestId: input.requestId,
-          response: commandResponse,
-        });
-        break;
-      }
-      case "item/fileChange/requestApproval": {
-        const fileResponse = parseFileChangeRequestApprovalResponse(
-          parsedResponse,
-        );
-        await this.service.submitFileApprovalDecision({
-          threadId: input.threadId,
-          ownerClientId,
-          requestId: input.requestId,
-          response: fileResponse,
-        });
-        break;
-      }
-      case "item/tool/requestUserInput": {
-        const toolResponse = parseToolRequestUserInputResponsePayload(
-          parsedResponse,
-        );
-        await this.service.submitUserInput({
-          threadId: input.threadId,
-          ownerClientId,
-          requestId: input.requestId,
-          response: toolResponse,
-        });
-        break;
-      }
-      case "execCommandApproval":
-      case "applyPatchApproval":
-        throw new Error(
-          `Legacy approval request method ${pendingIpcRequest.method} is not supported over desktop IPC for thread ${input.threadId}`,
-        );
-      case "account/chatgptAuthTokens/refresh":
-      case "item/tool/call":
-      case "item/plan/requestImplementation":
-        throw new Error(
-          `Unsupported pending request method ${pendingIpcRequest.method} for submitUserInput on thread ${input.threadId}`,
-        );
-    }
 
     return {
-      ownerClientId,
+      ownerClientId: ownerClientIdForResult,
       requestId: input.requestId,
     };
   }
 
   public async readLiveState(threadId: string): Promise<AgentThreadLiveState> {
-    const snapshotState = this.streamSnapshotByThreadId.get(threadId) ?? null;
-    const snapshotOrigin =
-      this.streamSnapshotOriginByThreadId.get(threadId) ?? null;
-    const ownerClientId =
-      this.threadOwnerById.get(threadId) ?? this.lastKnownOwnerClientId ?? null;
-    const rawEvents = this.streamEventsByThreadId.get(threadId) ?? [];
-    if (rawEvents.length === 0) {
-      return {
-        ownerClientId,
-        conversationState: snapshotState,
-        liveStateError: null,
-      };
-    }
-
-    const events: ReturnType<typeof parseThreadStreamStateChangedBroadcast>[] =
-      [];
-
-    for (let eventIndex = 0; eventIndex < rawEvents.length; eventIndex += 1) {
-      const event = rawEvents[eventIndex];
-      try {
-        events.push(parseThreadStreamStateChangedBroadcast(event));
-      } catch (error) {
-        logger.error(
-          {
-            threadId,
-            eventIndex,
-            error: toErrorMessage(error),
-            ...(error instanceof ProtocolValidationError
-              ? { issues: error.issues }
-              : {}),
-          },
-          "thread-stream-event-parse-failed",
-        );
-        return {
-          ownerClientId,
-          conversationState: snapshotState,
-          liveStateError: {
-            kind: "parseFailed",
-            message: toErrorMessage(error),
-            eventIndex,
-            patchIndex: null,
-          },
-        };
-      }
-    }
-
-    if (events.length === 0) {
-      return {
-        ownerClientId,
-        conversationState: snapshotState,
-        liveStateError: null,
-      };
-    }
-
-    const reductionWindow = trimThreadStreamEventsForReduction(events);
-    const reductionEvents = reductionWindow.events;
-    const canUseSyntheticSnapshot =
-      !reductionWindow.hasSnapshot &&
-      snapshotState !== null &&
-      snapshotOrigin === "stream";
-    const hasReliableReductionBase =
-      reductionWindow.hasSnapshot || canUseSyntheticSnapshot;
-
-    if (!hasReliableReductionBase) {
-      return {
-        ownerClientId,
-        conversationState: snapshotState,
-        liveStateError: null,
-      };
-    }
-
-    const reductionInput = canUseSyntheticSnapshot
-      ? [
-          buildSyntheticSnapshotEvent(
-            threadId,
-            ownerClientId ?? "farfield",
-            snapshotState,
-          ),
-          ...reductionEvents,
-        ]
-      : reductionEvents;
+    const startedAt = performance.now();
     try {
-      const reduced = reduceThreadStreamEvents(reductionInput);
-      const state = reduced.get(threadId);
       return {
-        ownerClientId: state?.ownerClientId ?? ownerClientId ?? null,
-        conversationState: state?.conversationState ?? snapshotState,
-        liveStateError: null,
+        ownerClientId:
+          this.threadOwnerById.get(threadId) ??
+          this.lastKnownOwnerClientId ??
+          null,
+        conversationState: this.streamSnapshotByThreadId.get(threadId) ?? null,
+        liveStateError: this.liveStateErrorByThreadId.get(threadId) ?? null,
       };
-    } catch (error) {
-      const reductionErrorDetails =
-        error instanceof ThreadStreamReductionError ? error.details : null;
-      const eventIndex = reductionErrorDetails?.eventIndex ?? null;
-      const patchIndex = reductionErrorDetails?.patchIndex ?? null;
-      const message = toErrorMessage(error);
-
-      logger.warn(
-        {
-          threadId,
-          error: message,
-          eventIndex,
-          patchIndex,
-        },
-        "thread-stream-reduction-failed",
-      );
-
-      return {
-        ownerClientId,
-        conversationState: snapshotState,
-        liveStateError: {
-          kind: "reductionFailed",
-          message,
-          eventIndex,
-          patchIndex,
-        },
-      };
+    } finally {
+      this.onTiming?.("codexLiveStateRead", performance.now() - startedAt);
     }
   }
 
@@ -927,9 +813,987 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
   }
 
-  private notifyStateChanged(): void {
-    if (this.onStateChange) {
-      this.onStateChange();
+  private emitAppFrame(event: CodexAppFrameEvent): void {
+    for (const listener of this.appFrameListeners) {
+      listener(event);
+    }
+  }
+
+  private async handleServerNotification(
+    notification: AppServerServerNotification,
+  ): Promise<void> {
+    const threadId = extractThreadIdFromAppServerNotification(notification);
+    this.updateActiveTurnFromAppServerNotification(notification);
+    if (threadId && !this.applyAppServerNotificationToSnapshot(notification)) {
+      this.scheduleThreadRefresh(
+        threadId,
+        this.resolveVisibleOwnerClientId(threadId),
+        "readThreadWithTurns",
+        APP_SERVER_THREAD_REFRESH_DEBOUNCE_MS,
+      );
+    }
+    this.emitAppFrame({
+      direction: "in",
+      kind: "notification",
+      frame: notification,
+      method: notification.method,
+      threadId,
+    });
+  }
+
+  private async handleServerRequest(
+    request: AppServerServerRequest,
+  ): Promise<void> {
+    await this.refreshThreadFromAppServer(
+      request.params.threadId,
+      this.resolveVisibleOwnerClientId(request.params.threadId),
+      "readThreadWithTurns",
+    );
+    this.emitAppFrame({
+      direction: "in",
+      kind: "request",
+      frame: request,
+      method: request.method,
+      threadId: request.params.threadId,
+    });
+  }
+
+  private scheduleThreadRefresh(
+    threadId: string,
+    sourceClientId: string | null,
+    origin: StreamSnapshotOrigin,
+    delayMs = APP_SERVER_THREAD_REFRESH_DEBOUNCE_MS,
+  ): void {
+    if (sourceClientId) {
+      this.threadOwnerById.set(threadId, sourceClientId);
+    }
+
+    const existingRefresh = this.pendingThreadRefreshByThreadId.get(threadId);
+    this.pendingThreadRefreshByThreadId.set(threadId, {
+      sourceClientId:
+        sourceClientId ??
+        existingRefresh?.sourceClientId ??
+        this.resolveVisibleOwnerClientId(threadId),
+      origin,
+      delayMs: existingRefresh?.delayMs ?? delayMs,
+    });
+
+    if (
+      this.pendingThreadRefreshTimers.has(threadId) ||
+      this.threadRefreshesInFlight.has(threadId)
+    ) {
+      return;
+    }
+
+    this.queueThreadRefreshTimer(threadId, delayMs);
+  }
+
+  private queueThreadRefreshTimer(threadId: string, delayMs: number): void {
+    if (this.pendingThreadRefreshTimers.has(threadId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingThreadRefreshTimers.delete(threadId);
+      void this.performScheduledThreadRefresh(threadId);
+    }, delayMs);
+    timer.unref();
+    this.pendingThreadRefreshTimers.set(threadId, timer);
+  }
+
+  private async performScheduledThreadRefresh(threadId: string): Promise<void> {
+    const pendingRefresh = this.pendingThreadRefreshByThreadId.get(threadId);
+    if (!pendingRefresh) {
+      return;
+    }
+
+    if (this.threadRefreshesInFlight.has(threadId)) {
+      this.queueThreadRefreshTimer(threadId, pendingRefresh.delayMs);
+      return;
+    }
+
+    this.pendingThreadRefreshByThreadId.delete(threadId);
+    this.threadRefreshesInFlight.add(threadId);
+
+    try {
+      await this.refreshThreadFromAppServer(
+        threadId,
+        pendingRefresh.sourceClientId,
+        pendingRefresh.origin,
+      );
+    } finally {
+      this.threadRefreshesInFlight.delete(threadId);
+      const nextRefresh = this.pendingThreadRefreshByThreadId.get(threadId);
+      if (nextRefresh) {
+        this.queueThreadRefreshTimer(threadId, nextRefresh.delayMs);
+      }
+    }
+  }
+
+  private async refreshThreadFromAppServer(
+    threadId: string,
+    sourceClientId: string | null,
+    origin: StreamSnapshotOrigin,
+  ): Promise<void> {
+    const startedAt = performance.now();
+    try {
+      const readResult = await this.readThread({
+        threadId,
+        includeTurns: true,
+      });
+      const storedThread = this.storeThreadSnapshot(
+        threadId,
+        readResult.thread,
+        origin,
+        sourceClientId,
+        true,
+      );
+      this.scheduleThreadSnapshotBroadcastToOwner(
+        threadId,
+        storedThread,
+        sourceClientId,
+      );
+    } catch (error) {
+      if (error instanceof AppServerRpcError && error.code === -32001) {
+        this.scheduleThreadRefresh(
+          threadId,
+          sourceClientId,
+          origin,
+          THREAD_REFRESH_RETRY_DELAY_MS,
+        );
+        return;
+      }
+
+      logger.warn(
+        {
+          threadId,
+          error: toErrorMessage(error),
+          ...(error instanceof ProtocolValidationError
+            ? { issues: error.issues }
+            : {}),
+        },
+        "app-server-thread-refresh-failed",
+      );
+    } finally {
+      this.onTiming?.("codexThreadRefresh", performance.now() - startedAt);
+    }
+  }
+
+  private storeThreadSnapshot(
+    threadId: string,
+    thread: ThreadConversationState,
+    origin: StreamSnapshotOrigin,
+    sourceClientId: string | null,
+    appendSyntheticSnapshotEvent: boolean,
+  ): ThreadConversationState {
+    const currentSnapshot = this.streamSnapshotByThreadId.get(threadId);
+    const currentOrigin = this.streamSnapshotOriginByThreadId.get(threadId);
+    const shouldMergeReadSnapshot =
+      currentSnapshot !== undefined &&
+      currentOrigin === "stream" &&
+      origin !== "stream";
+    const nextOrigin =
+      shouldMergeReadSnapshot && currentOrigin ? currentOrigin : origin;
+    const mergedThread = shouldMergeReadSnapshot
+      ? mergeThreadConversationStates(currentSnapshot, thread)
+      : thread;
+    const nextThread = this.applyPendingCollaborationMode(mergedThread);
+    this.streamSnapshotByThreadId.set(threadId, nextThread);
+    this.streamSnapshotOriginByThreadId.set(threadId, nextOrigin);
+    this.liveStateErrorByThreadId.delete(threadId);
+    this.setThreadTitle(threadId, nextThread.title);
+    this.syncActiveTurnIdFromThreadState(threadId, nextThread);
+
+    if (!appendSyntheticSnapshotEvent) {
+      return nextThread;
+    }
+
+    const nextSourceClientId = sourceClientId ?? "app-server";
+    const currentEvents = this.streamEventsByThreadId.get(threadId) ?? [];
+    currentEvents.push(
+      buildSyntheticSnapshotEvent(threadId, nextSourceClientId, nextThread),
+    );
+    if (currentEvents.length > 400) {
+      currentEvents.splice(0, currentEvents.length - 400);
+    }
+    this.streamEventsByThreadId.set(threadId, currentEvents);
+    this.notifyThreadStateChanged(threadId);
+    return nextThread;
+  }
+
+  private recordThreadStreamEvent(
+    frame: IpcFrame,
+    threadId: string,
+    sourceClientId: string | null,
+  ): boolean {
+    let parsedFrame: ThreadStreamStateChangedBroadcast;
+    try {
+      parsedFrame = parseThreadStreamStateChangedBroadcast(frame);
+    } catch (error) {
+      logger.error(
+        {
+          threadId,
+          error: toErrorMessage(error),
+          ...(error instanceof ProtocolValidationError
+            ? { issues: error.issues }
+            : {}),
+        },
+        "thread-stream-event-parse-failed",
+      );
+      this.liveStateErrorByThreadId.set(threadId, {
+        kind: "parseFailed",
+        message: toErrorMessage(error),
+        eventIndex: null,
+        patchIndex: null,
+      });
+      return false;
+    }
+
+    const currentEvents = this.streamEventsByThreadId.get(threadId) ?? [];
+    currentEvents.push(parsedFrame);
+    if (currentEvents.length > 400) {
+      currentEvents.splice(0, currentEvents.length - 400);
+    }
+    this.streamEventsByThreadId.set(threadId, currentEvents);
+
+    if (parsedFrame.params.change.type === "snapshot") {
+      this.streamPatchSyncDisabledThreadIds.delete(threadId);
+      this.storeThreadSnapshot(
+        threadId,
+        parsedFrame.params.change.conversationState,
+        "stream",
+        sourceClientId,
+        false,
+      );
+      this.notifyThreadStateChanged(threadId);
+      return false;
+    }
+
+    if (this.streamPatchSyncDisabledThreadIds.has(threadId)) {
+      this.notifyThreadStateChanged(threadId);
+      return false;
+    }
+
+    const currentSnapshot = this.streamSnapshotByThreadId.get(threadId);
+    if (!currentSnapshot) {
+      this.streamPatchSyncDisabledThreadIds.add(threadId);
+      this.liveStateErrorByThreadId.set(threadId, {
+        kind: "reductionFailed",
+        message: "Thread stream patches arrived before any thread snapshot",
+        eventIndex: null,
+        patchIndex: null,
+      });
+      this.notifyThreadStateChanged(threadId);
+      return true;
+    }
+
+    try {
+      let nextSnapshot = currentSnapshot;
+      for (let patchIndex = 0; patchIndex < parsedFrame.params.change.patches.length; patchIndex += 1) {
+        const patch = parsedFrame.params.change.patches[patchIndex];
+        if (!patch) {
+          continue;
+        }
+        nextSnapshot = applyStrictPatch(nextSnapshot, patch);
+      }
+      this.storeThreadSnapshot(
+        threadId,
+        nextSnapshot,
+        "stream",
+        sourceClientId,
+        false,
+      );
+    } catch (error) {
+      logger.warn(
+        {
+          threadId,
+          error: toErrorMessage(error),
+        },
+        "thread-stream-patch-apply-failed",
+      );
+      this.streamPatchSyncDisabledThreadIds.add(threadId);
+      this.liveStateErrorByThreadId.set(threadId, {
+        kind: "reductionFailed",
+        message: toErrorMessage(error),
+        eventIndex: null,
+        patchIndex: null,
+      });
+      this.notifyThreadStateChanged(threadId);
+      return true;
+    }
+
+    this.notifyThreadStateChanged(threadId);
+    return false;
+  }
+
+  private applyAppServerNotificationToSnapshot(
+    notification: AppServerServerNotification,
+  ): boolean {
+    const threadId = extractThreadIdFromAppServerNotification(notification);
+    if (!threadId) {
+      return false;
+    }
+
+    const currentSnapshot = this.streamSnapshotByThreadId.get(threadId) ?? null;
+    const currentSnapshotOrigin =
+      this.streamSnapshotOriginByThreadId.get(threadId) ?? "readThread";
+    const ownerClientId = this.resolveVisibleOwnerClientId(threadId);
+
+    if (notification.method === "thread/started") {
+      const parsedThreadStarted =
+        AppServerThreadStartedStateNotificationSchema.safeParse(notification);
+      if (!parsedThreadStarted.success) {
+        return false;
+      }
+
+      const nextThread = parseThreadConversationState(
+        parsedThreadStarted.data.params.thread,
+      );
+      const storedThread = this.storeThreadSnapshot(
+        threadId,
+        nextThread,
+        currentSnapshotOrigin,
+        ownerClientId,
+        false,
+      );
+      this.scheduleThreadSnapshotBroadcastToOwner(
+        threadId,
+        storedThread,
+        ownerClientId,
+      );
+      this.notifyThreadStateChanged(threadId);
+      return true;
+    }
+
+    if (!currentSnapshot) {
+      return false;
+    }
+
+    const nextThread = (() => {
+      switch (notification.method) {
+        case "thread/status/changed": {
+          const parsedStatusChanged =
+            AppServerThreadStatusChangedNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedStatusChanged.success) {
+            return null;
+          }
+          return {
+            ...currentSnapshot,
+            status: parsedStatusChanged.data.params.status,
+          };
+        }
+        case "thread/name/updated": {
+          const parsedNameUpdated =
+            AppServerThreadNameUpdatedNotificationSchema.safeParse(notification);
+          if (!parsedNameUpdated.success) {
+            return null;
+          }
+          return {
+            ...currentSnapshot,
+            title: parsedNameUpdated.data.params.threadName ?? null,
+          };
+        }
+        case "thread/archived":
+        case "thread/unarchived":
+        case "thread/closed":
+        case "thread/realtime/started":
+        case "thread/realtime/itemAdded":
+        case "thread/realtime/outputAudio/delta":
+        case "thread/realtime/error":
+        case "thread/realtime/closed":
+        case "windows/worldWritableWarning":
+        case "windowsSandbox/setupCompleted":
+          return currentSnapshot;
+        case "turn/started":
+        case "turn/completed": {
+          const parsedTurnNotification =
+            AppServerTurnThreadNotificationSchema.safeParse(notification);
+          if (!parsedTurnNotification.success) {
+            return null;
+          }
+          return upsertTurnIntoThread(
+            currentSnapshot,
+            parsedTurnNotification.data.params.turn,
+          );
+        }
+        case "turn/diff/updated": {
+          const parsedDiffUpdated =
+            AppServerTurnDiffUpdatedNotificationSchema.safeParse(notification);
+          if (!parsedDiffUpdated.success) {
+            return null;
+          }
+          return updateThreadTurn(
+            currentSnapshot,
+            parsedDiffUpdated.data.params.turnId,
+            (turn) => ({
+              ...turn,
+              diff: parsedDiffUpdated.data.params.diff,
+            }),
+          );
+        }
+        case "turn/plan/updated": {
+          const parsedPlanUpdated =
+            AppServerTurnPlanUpdatedNotificationSchema.safeParse(notification);
+          if (!parsedPlanUpdated.success) {
+            return null;
+          }
+          return upsertTurnItem(
+            currentSnapshot,
+            parsedPlanUpdated.data.params.turnId,
+            TodoListItemSchema.parse({
+              id: buildSyntheticTurnItemId(
+                "turn-plan",
+                parsedPlanUpdated.data.params.turnId,
+              ),
+              type: "todo-list",
+              explanation: parsedPlanUpdated.data.params.explanation,
+              plan: parsedPlanUpdated.data.params.plan,
+            }),
+          );
+        }
+        case "item/started":
+        case "item/completed": {
+          const parsedItemNotification =
+            AppServerItemThreadNotificationSchema.safeParse(notification);
+          if (!parsedItemNotification.success) {
+            return null;
+          }
+          return upsertTurnItem(
+            currentSnapshot,
+            parsedItemNotification.data.params.turnId,
+            parsedItemNotification.data.params.item,
+          );
+        }
+        case "item/agentMessage/delta": {
+          const parsedAgentMessageDelta =
+            AppServerAgentMessageDeltaNotificationSchema.safeParse(notification);
+          if (!parsedAgentMessageDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedAgentMessageDelta.data.params.turnId,
+            parsedAgentMessageDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "agentMessage") {
+                return item;
+              }
+              return {
+                ...item,
+                text: `${item.text}${parsedAgentMessageDelta.data.params.delta}`,
+              };
+            },
+          );
+        }
+        case "item/reasoning/textDelta": {
+          const parsedReasoningDelta =
+            AppServerReasoningTextDeltaNotificationSchema.safeParse(notification);
+          if (!parsedReasoningDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedReasoningDelta.data.params.turnId,
+            parsedReasoningDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "reasoning") {
+                return item;
+              }
+              const content = [...(item.content ?? [])];
+              const index = parsedReasoningDelta.data.params.contentIndex;
+              const currentValue = content[index];
+              const currentText =
+                typeof currentValue === "string" ? currentValue : "";
+              content[index] = `${currentText}${parsedReasoningDelta.data.params.delta}`;
+              return {
+                ...item,
+                content,
+                text: `${item.text ?? ""}${parsedReasoningDelta.data.params.delta}`,
+              };
+            },
+          );
+        }
+        case "item/reasoning/summaryPartAdded": {
+          const parsedSummaryPart =
+            AppServerReasoningSummaryPartAddedNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedSummaryPart.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedSummaryPart.data.params.turnId,
+            parsedSummaryPart.data.params.itemId,
+            (item) => {
+              if (item.type !== "reasoning") {
+                return item;
+              }
+              const summary = [...(item.summary ?? [])];
+              const index = parsedSummaryPart.data.params.summaryIndex;
+              while (summary.length <= index) {
+                summary.push("");
+              }
+              return {
+                ...item,
+                summary,
+              };
+            },
+          );
+        }
+        case "item/reasoning/summaryTextDelta": {
+          const parsedSummaryDelta =
+            AppServerReasoningSummaryTextDeltaNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedSummaryDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedSummaryDelta.data.params.turnId,
+            parsedSummaryDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "reasoning") {
+                return item;
+              }
+              const summary = [...(item.summary ?? [])];
+              const index = parsedSummaryDelta.data.params.summaryIndex;
+              while (summary.length <= index) {
+                summary.push("");
+              }
+              summary[index] = `${summary[index] ?? ""}${parsedSummaryDelta.data.params.delta}`;
+              return {
+                ...item,
+                summary,
+              };
+            },
+          );
+        }
+        case "item/plan/delta": {
+          const parsedPlanDelta =
+            AppServerPlanDeltaNotificationSchema.safeParse(notification);
+          if (!parsedPlanDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedPlanDelta.data.params.turnId,
+            parsedPlanDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "plan") {
+                return item;
+              }
+              return {
+                ...item,
+                text: `${item.text}${parsedPlanDelta.data.params.delta}`,
+              };
+            },
+          );
+        }
+        case "item/commandExecution/outputDelta": {
+          const parsedCommandDelta =
+            AppServerCommandOutputDeltaNotificationSchema.safeParse(notification);
+          if (!parsedCommandDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedCommandDelta.data.params.turnId,
+            parsedCommandDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "commandExecution") {
+                return item;
+              }
+              return {
+                ...item,
+                aggregatedOutput: `${item.aggregatedOutput ?? ""}${parsedCommandDelta.data.params.delta}`,
+              };
+            },
+          );
+        }
+        case "item/commandExecution/terminalInteraction": {
+          const parsedTerminalInteraction =
+            AppServerTerminalInteractionNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedTerminalInteraction.success) {
+            return null;
+          }
+          return currentSnapshot;
+        }
+        case "item/fileChange/outputDelta": {
+          const parsedFileChangeDelta =
+            AppServerFileChangeOutputDeltaNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedFileChangeDelta.success) {
+            return null;
+          }
+          return updateThreadItem(
+            currentSnapshot,
+            parsedFileChangeDelta.data.params.turnId,
+            parsedFileChangeDelta.data.params.itemId,
+            (item) => {
+              if (item.type !== "fileChange") {
+                return item;
+              }
+              if (item.changes.length === 0) {
+                return item;
+              }
+              const nextChanges = [...item.changes];
+              const lastChange = nextChanges[nextChanges.length - 1];
+              if (!lastChange) {
+                return item;
+              }
+              nextChanges[nextChanges.length - 1] = {
+                ...lastChange,
+                diff: `${lastChange.diff ?? ""}${parsedFileChangeDelta.data.params.delta}`,
+              };
+              return {
+                ...item,
+                changes: nextChanges,
+              };
+            },
+          );
+        }
+        case "item/mcpToolCall/progress": {
+          const parsedMcpProgress =
+            AppServerMcpToolCallProgressNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedMcpProgress.success) {
+            return null;
+          }
+          return currentSnapshot;
+        }
+        case "thread/tokenUsage/updated": {
+          const parsedTokenUsage =
+            AppServerThreadTokenUsageUpdatedNotificationSchema.safeParse(
+              notification,
+            );
+          if (!parsedTokenUsage.success) {
+            return null;
+          }
+          return {
+            ...currentSnapshot,
+            latestTokenUsageInfo: parsedTokenUsage.data.params.tokenUsage,
+          };
+        }
+        case "thread/compacted": {
+          const parsedCompacted =
+            AppServerThreadCompactedNotificationSchema.safeParse(notification);
+          if (!parsedCompacted.success) {
+            return null;
+          }
+          return upsertTurnItem(
+            currentSnapshot,
+            parsedCompacted.data.params.turnId,
+            ContextCompactionItemSchema.parse({
+              id: buildSyntheticTurnItemId(
+                "context-compaction",
+                parsedCompacted.data.params.turnId,
+              ),
+              type: "contextCompaction",
+            }),
+          );
+        }
+        case "model/rerouted": {
+          const parsedModelRerouted =
+            AppServerModelReroutedNotificationSchema.safeParse(notification);
+          if (!parsedModelRerouted.success) {
+            return null;
+          }
+          return upsertTurnItem(
+            {
+              ...currentSnapshot,
+              latestModel: parsedModelRerouted.data.params.toModel,
+            },
+            parsedModelRerouted.data.params.turnId,
+            ModelChangedItemSchema.parse({
+              id: buildSyntheticTurnItemId(
+                "model-rerouted",
+                parsedModelRerouted.data.params.turnId,
+              ),
+              type: "modelChanged",
+              fromModel: parsedModelRerouted.data.params.fromModel,
+              toModel: parsedModelRerouted.data.params.toModel,
+            }),
+          );
+        }
+        case "error": {
+          const parsedErrorNotification =
+            AppServerErrorNotificationSchema.safeParse(notification);
+          if (!parsedErrorNotification.success) {
+            return null;
+          }
+          return upsertTurnItem(
+            currentSnapshot,
+            parsedErrorNotification.data.params.turnId,
+            ErrorItemSchema.parse({
+              id: buildSyntheticTurnItemId(
+                "turn-error",
+                parsedErrorNotification.data.params.turnId,
+              ),
+              type: "error",
+              message: parsedErrorNotification.data.params.error.message,
+              willRetry: parsedErrorNotification.data.params.willRetry,
+              errorInfo:
+                parsedErrorNotification.data.params.error.codexErrorInfo ===
+                null
+                  ? null
+                  : JSON.stringify(
+                      parsedErrorNotification.data.params.error.codexErrorInfo,
+                    ),
+              additionalDetails:
+                parsedErrorNotification.data.params.error.additionalDetails,
+            }),
+          );
+        }
+        default:
+          return null;
+      }
+    })();
+
+    if (!nextThread) {
+      return false;
+    }
+
+    if (nextThread === currentSnapshot) {
+      return true;
+    }
+
+    const storedThread = this.storeThreadSnapshot(
+      threadId,
+      nextThread,
+      currentSnapshotOrigin,
+      ownerClientId,
+      false,
+    );
+    if (shouldBroadcastThreadSnapshotForAppServerNotification(notification.method)) {
+      this.scheduleThreadSnapshotBroadcastToOwner(
+        threadId,
+        storedThread,
+        ownerClientId,
+      );
+    }
+    this.notifyThreadStateChanged(threadId);
+    return true;
+  }
+
+  private scheduleThreadSnapshotBroadcastToOwner(
+    threadId: string,
+    thread: ThreadConversationState,
+    ownerClientId: string | null,
+    delayMs = 80,
+  ): void {
+    this.pendingOwnerBroadcastByThreadId.set(threadId, {
+      thread,
+      ownerClientId,
+    });
+
+    if (this.pendingOwnerBroadcastTimers.has(threadId)) {
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      this.pendingOwnerBroadcastTimers.delete(threadId);
+      const pending = this.pendingOwnerBroadcastByThreadId.get(threadId);
+      if (!pending) {
+        return;
+      }
+      this.pendingOwnerBroadcastByThreadId.delete(threadId);
+      this.broadcastThreadSnapshotToOwner(
+        threadId,
+        pending.thread,
+        pending.ownerClientId,
+      );
+    }, delayMs);
+    timer.unref();
+    this.pendingOwnerBroadcastTimers.set(threadId, timer);
+  }
+
+  private broadcastThreadSnapshotToOwner(
+    threadId: string,
+    thread: ThreadConversationState,
+    ownerClientId: string | null,
+  ): void {
+    const targetClientId = normalizeNonEmptyString(ownerClientId);
+    if (!targetClientId || !this.isIpcReady()) {
+      return;
+    }
+
+    if (this.ipcClientId && targetClientId === this.ipcClientId) {
+      return;
+    }
+
+    try {
+      const event = buildSyntheticSnapshotEvent(threadId, "farfield", thread);
+      this.replayBroadcast("thread-stream-state-changed", event.params, {
+        targetClientId,
+        version: event.version,
+      });
+    } catch (error) {
+      logger.warn(
+        {
+          threadId,
+          targetClientId,
+          error: toErrorMessage(error),
+        },
+        "desktop-thread-sync-broadcast-failed",
+      );
+    }
+  }
+
+  private async resolveTurnModelId(
+    threadId: string,
+    requestedModel: string | undefined,
+    pendingCollaborationMode: AgentTurnCollaborationMode | null | undefined,
+  ): Promise<string> {
+    const explicitModel = normalizeNonEmptyString(requestedModel);
+    if (explicitModel) {
+      return explicitModel;
+    }
+
+    const pendingModeModel = normalizeNonEmptyString(
+      pendingCollaborationMode?.settings.model,
+    );
+    if (pendingModeModel) {
+      return pendingModeModel;
+    }
+
+    const snapshot = this.streamSnapshotByThreadId.get(threadId);
+    const snapshotModeModel = normalizeNonEmptyString(
+      snapshot?.latestCollaborationMode?.settings.model,
+    );
+    if (snapshotModeModel) {
+      return snapshotModeModel;
+    }
+
+    const snapshotLatestModel = normalizeNonEmptyString(snapshot?.latestModel);
+    if (snapshotLatestModel) {
+      return snapshotLatestModel;
+    }
+
+    const readResult = await this.readThread({
+      threadId,
+      includeTurns: false,
+    });
+    const threadModeModel = normalizeNonEmptyString(
+      readResult.thread.latestCollaborationMode?.settings.model,
+    );
+    if (threadModeModel) {
+      return threadModeModel;
+    }
+
+    const threadLatestModel = normalizeNonEmptyString(
+      readResult.thread.latestModel,
+    );
+    if (threadLatestModel) {
+      return threadLatestModel;
+    }
+
+    const models = await this.runAppServerCall(() => this.appClient.listModels(200));
+    const defaultModel = normalizeNonEmptyString(
+      models.data.find((entry) => entry.isDefault)?.model,
+    );
+    if (defaultModel) {
+      return defaultModel;
+    }
+
+    const firstModel = normalizeNonEmptyString(models.data[0]?.model);
+    if (firstModel) {
+      return firstModel;
+    }
+
+    throw new Error(`No model is available for thread ${threadId}`);
+  }
+
+  private resolveVisibleOwnerClientId(
+    threadId: string,
+    override?: string,
+  ): string | null {
+    if (override && override.trim().length > 0) {
+      return override.trim();
+    }
+    const mapped = this.threadOwnerById.get(threadId);
+    if (mapped && mapped.trim().length > 0) {
+      return mapped.trim();
+    }
+    if (this.lastKnownOwnerClientId && this.lastKnownOwnerClientId.trim()) {
+      return this.lastKnownOwnerClientId.trim();
+    }
+    return null;
+  }
+
+  private applyPendingCollaborationMode(
+    thread: ThreadConversationState,
+  ): ThreadConversationState {
+    const pendingMode = this.pendingCollaborationModeByThreadId.get(thread.id);
+    if (!pendingMode) {
+      return thread;
+    }
+
+    return {
+      ...thread,
+      latestCollaborationMode: pendingMode,
+      latestModel: pendingMode.settings.model ?? thread.latestModel,
+      latestReasoningEffort:
+        pendingMode.settings.reasoning_effort ?? thread.latestReasoningEffort,
+    };
+  }
+
+  private syncActiveTurnIdFromThreadState(
+    threadId: string,
+    thread: ThreadConversationState,
+  ): void {
+    const activeTurnId = findActiveTurnId(thread);
+    if (!activeTurnId) {
+      this.activeTurnIdByThreadId.delete(threadId);
+      return;
+    }
+
+    this.activeTurnIdByThreadId.set(threadId, activeTurnId);
+  }
+
+  private updateActiveTurnFromAppServerNotification(
+    notification: AppServerServerNotification,
+  ): void {
+    const parsedTurnNotification =
+      AppServerTurnNotificationEnvelopeSchema.safeParse(notification);
+    if (!parsedTurnNotification.success) {
+      return;
+    }
+
+    const turnId =
+      parsedTurnNotification.data.params.turn.turnId ??
+      parsedTurnNotification.data.params.turn.id;
+    if (!turnId) {
+      return;
+    }
+
+    if (notification.method === "turn/completed") {
+      this.activeTurnIdByThreadId.delete(parsedTurnNotification.data.params.threadId);
+      return;
+    }
+
+    this.activeTurnIdByThreadId.set(
+      parsedTurnNotification.data.params.threadId,
+      turnId,
+    );
+  }
+
+  private notifyThreadStateChanged(threadId: string): void {
+    if (this.onThreadStateChange) {
+      this.onThreadStateChange(threadId);
+    }
+  }
+
+  private notifyRuntimeStateChanged(): void {
+    if (this.onRuntimeStateChange) {
+      this.onRuntimeStateChange();
     }
   }
 
@@ -946,7 +1810,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     }
 
     this.runtimeState = next;
-    this.notifyStateChanged();
+    this.notifyRuntimeStateChanged();
   }
 
   private patchRuntimeState(patch: Partial<CodexAgentRuntimeState>): void {
@@ -1043,7 +1907,8 @@ export class CodexAgentAdapter implements AgentAdapter {
           ipcConnected: true,
         });
 
-        await this.ipcClient.initialize(this.label);
+        const initializeResponse = await this.ipcClient.initialize(this.label);
+        this.ipcClientId = extractIpcClientId(initializeResponse) ?? null;
         this.patchRuntimeState({
           ipcInitialized: true,
         });
@@ -1063,38 +1928,19 @@ export class CodexAgentAdapter implements AgentAdapter {
   }
 
   private async getActiveTurnId(threadId: string): Promise<string | null> {
+    const cachedTurnId = this.activeTurnIdByThreadId.get(threadId);
+    if (cachedTurnId) {
+      return cachedTurnId;
+    }
+
     const readResult = await this.runAppServerCall(() =>
       this.appClient.readThread(threadId, true),
     );
-    const turns = readResult.thread.turns;
-
-    for (let index = turns.length - 1; index >= 0; index -= 1) {
-      const turn = turns[index];
-      if (!turn) {
-        continue;
-      }
-
-      const status = turn.status.trim().toLowerCase();
-      const isTerminal =
-        status === "completed" ||
-        status === "failed" ||
-        status === "error" ||
-        status === "cancelled" ||
-        status === "canceled";
-      if (isTerminal) {
-        continue;
-      }
-
-      if (turn.turnId && turn.turnId.trim().length > 0) {
-        return turn.turnId.trim();
-      }
-
-      if (turn.id && turn.id.trim().length > 0) {
-        return turn.id.trim();
-      }
-    }
-
-    return null;
+    const parsedThread = this.applyPendingCollaborationMode(
+      parseThreadConversationState(readResult.thread),
+    );
+    this.syncActiveTurnIdFromThreadState(threadId, parsedThread);
+    return this.activeTurnIdByThreadId.get(threadId) ?? null;
   }
 
   private async resumeThread(threadId: string): Promise<void> {
@@ -1157,34 +2003,6 @@ export class CodexAgentAdapter implements AgentAdapter {
 
     await this.resumeThread(threadId);
     return this.runAppServerCall(operation);
-  }
-
-  private async resolvePendingIpcRequest(
-    threadId: string,
-    requestId: UserInputRequestId,
-  ): Promise<ThreadConversationRequest> {
-    const cachedSnapshot = this.streamSnapshotByThreadId.get(threadId);
-    if (cachedSnapshot) {
-      const pending = findPendingRequestWithId(cachedSnapshot, requestId);
-      if (pending) {
-        return pending;
-      }
-    }
-
-    const liveState = await this.readLiveState(threadId);
-    if (liveState.conversationState) {
-      const pending = findPendingRequestWithId(
-        liveState.conversationState,
-        requestId,
-      );
-      if (pending) {
-        return pending;
-      }
-    }
-
-    throw new Error(
-      `Unable to find pending request ${String(requestId)} in live state for thread ${threadId}`,
-    );
   }
 
   private resolveThreadTitle(
@@ -1309,6 +2127,15 @@ function normalizeStderrLine(line: string): string {
   return line.replace(ANSI_ESCAPE_REGEX, "").trim();
 }
 
+function normalizeNonEmptyString(value: string | null | undefined): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
 function isThreadStateGenerating(state: ThreadConversationState): boolean {
   for (let index = state.turns.length - 1; index >= 0; index -= 1) {
     const turn = state.turns[index];
@@ -1340,8 +2167,12 @@ function deriveThreadWaitingState(
   waitingOnApproval: boolean;
   waitingOnUserInput: boolean;
 } {
-  let waitingOnApproval = false;
-  let waitingOnUserInput = false;
+  let waitingOnApproval =
+    state.status?.type === "active" &&
+    state.status.activeFlags.includes("waitingOnApproval");
+  let waitingOnUserInput =
+    state.status?.type === "active" &&
+    state.status.activeFlags.includes("waitingOnUserInput");
 
   for (const request of state.requests) {
     if (request.completed === true) {
@@ -1378,6 +2209,38 @@ function requestIdsMatch(
   return `${left}` === `${right}`;
 }
 
+function isTerminalTurnStatus(status: string): boolean {
+  const normalized = status.trim().toLowerCase();
+  return (
+    normalized === "completed" ||
+    normalized === "failed" ||
+    normalized === "error" ||
+    normalized === "cancelled" ||
+    normalized === "canceled" ||
+    normalized === "interrupted" ||
+    normalized === "aborted"
+  );
+}
+
+function findActiveTurnId(state: ThreadConversationState): string | null {
+  for (let index = state.turns.length - 1; index >= 0; index -= 1) {
+    const turn = state.turns[index];
+    if (!turn || isTerminalTurnStatus(turn.status)) {
+      continue;
+    }
+
+    if (turn.turnId && turn.turnId.trim().length > 0) {
+      return turn.turnId.trim();
+    }
+
+    if (turn.id && turn.id.trim().length > 0) {
+      return turn.id.trim();
+    }
+  }
+
+  return null;
+}
+
 function findPendingRequestWithId(
   state: ThreadConversationState,
   requestId: UserInputRequestId,
@@ -1391,6 +2254,171 @@ function findPendingRequestWithId(
     }
   }
   return null;
+}
+
+export function mergeThreadConversationStates(
+  currentThread: ThreadConversationState,
+  nextReadThread: ThreadConversationState,
+): ThreadConversationState {
+  return parseThreadConversationState({
+    ...currentThread,
+    ...nextReadThread,
+    turns: mergeThreadTurns(currentThread.turns, nextReadThread.turns),
+    requests: mergeThreadRequests(
+      currentThread.requests,
+      nextReadThread.requests,
+    ),
+  });
+}
+
+function mergeThreadTurns(
+  currentTurns: ThreadTurn[],
+  nextTurns: ThreadTurn[],
+): ThreadTurn[] {
+  const nextTurnsByKey = new Map<string, ThreadTurn>();
+  for (const nextTurn of nextTurns) {
+    const key = threadTurnKey(nextTurn);
+    if (!key) {
+      continue;
+    }
+    nextTurnsByKey.set(key, nextTurn);
+  }
+
+  const mergedTurns: ThreadTurn[] = [];
+  const seenKeys = new Set<string>();
+  for (const currentTurn of currentTurns) {
+    const key = threadTurnKey(currentTurn);
+    if (!key) {
+      mergedTurns.push(currentTurn);
+      continue;
+    }
+
+    const nextTurn = nextTurnsByKey.get(key);
+    if (!nextTurn) {
+      mergedTurns.push(currentTurn);
+      continue;
+    }
+
+    mergedTurns.push(mergeThreadTurn(currentTurn, nextTurn));
+    seenKeys.add(key);
+  }
+
+  for (const nextTurn of nextTurns) {
+    const key = threadTurnKey(nextTurn);
+    if (!key) {
+      mergedTurns.push(nextTurn);
+      continue;
+    }
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    mergedTurns.push(nextTurn);
+  }
+
+  return mergedTurns;
+}
+
+function mergeThreadTurn(
+  currentTurn: ThreadTurn,
+  nextTurn: ThreadTurn,
+): ThreadTurn {
+  return ThreadTurnSchema.parse({
+    ...currentTurn,
+    ...nextTurn,
+    items: mergeTurnItems(currentTurn.items, nextTurn.items),
+  });
+}
+
+function threadTurnKey(turn: ThreadTurn): string | null {
+  if (turn.turnId && turn.turnId.trim().length > 0) {
+    return `turnId:${turn.turnId}`;
+  }
+  if (turn.id && turn.id.trim().length > 0) {
+    return `id:${turn.id}`;
+  }
+  return null;
+}
+
+function mergeTurnItems(
+  currentItems: TurnItem[],
+  nextItems: TurnItem[],
+): TurnItem[] {
+  const nextItemsById = new Map(nextItems.map((item) => [item.id, item]));
+  const mergedItems: TurnItem[] = [];
+  const seenIds = new Set<string>();
+
+  for (const currentItem of currentItems) {
+    const nextItem = nextItemsById.get(currentItem.id);
+    if (!nextItem) {
+      mergedItems.push(currentItem);
+      continue;
+    }
+
+    mergedItems.push(mergeTurnItem(currentItem, nextItem));
+    seenIds.add(currentItem.id);
+  }
+
+  for (const nextItem of nextItems) {
+    if (seenIds.has(nextItem.id)) {
+      continue;
+    }
+    mergedItems.push(nextItem);
+  }
+
+  return mergedItems;
+}
+
+function mergeTurnItem(currentItem: TurnItem, nextItem: TurnItem): TurnItem {
+  if (currentItem.type !== nextItem.type) {
+    return nextItem;
+  }
+
+  return TurnItemSchema.parse({
+    ...currentItem,
+    ...nextItem,
+  });
+}
+
+function mergeThreadRequests(
+  currentRequests: ThreadConversationRequest[],
+  nextRequests: ThreadConversationRequest[],
+): ThreadConversationRequest[] {
+  const nextRequestsByKey = new Map(
+    nextRequests.map((request) => [threadRequestKey(request), request]),
+  );
+  const mergedRequests: ThreadConversationRequest[] = [];
+  const seenKeys = new Set<string>();
+
+  for (const currentRequest of currentRequests) {
+    const key = threadRequestKey(currentRequest);
+    const nextRequest = nextRequestsByKey.get(key);
+    if (!nextRequest) {
+      mergedRequests.push(currentRequest);
+      continue;
+    }
+
+    mergedRequests.push(
+      ThreadConversationRequestSchema.parse({
+        ...currentRequest,
+        ...nextRequest,
+      }),
+    );
+    seenKeys.add(key);
+  }
+
+  for (const nextRequest of nextRequests) {
+    const key = threadRequestKey(nextRequest);
+    if (seenKeys.has(key)) {
+      continue;
+    }
+    mergedRequests.push(nextRequest);
+  }
+
+  return mergedRequests;
+}
+
+function threadRequestKey(request: ThreadConversationRequest): string {
+  return `${request.method}:${String(request.id)}`;
 }
 
 function buildSyntheticSnapshotEvent(
@@ -1415,28 +2443,499 @@ function buildSyntheticSnapshotEvent(
   };
 }
 
-function trimThreadStreamEventsForReduction(
-  events: ThreadStreamStateChangedBroadcast[],
-): { events: ThreadStreamStateChangedBroadcast[]; hasSnapshot: boolean } {
-  let latestSnapshotIndex = -1;
-  for (let index = 0; index < events.length; index += 1) {
-    const event = events[index];
-    if (event?.params.change.type === "snapshot") {
-      latestSnapshotIndex = index;
-    }
-  }
+const AppServerThreadIdParamsSchema = z
+  .object({
+    threadId: z.string().min(1),
+  })
+  .passthrough();
 
-  if (latestSnapshotIndex === -1) {
-    return {
-      events,
-      hasSnapshot: false,
+const AppServerThreadStartedNotificationSchema = z
+  .object({
+    method: z.literal("thread/started"),
+    params: z
+      .object({
+        thread: z
+          .object({
+            id: z.string().min(1),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerTurnNotificationEnvelopeSchema = z
+  .object({
+    method: z.union([z.literal("turn/started"), z.literal("turn/completed")]),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turn: z
+          .object({
+            id: z.string().min(1).optional(),
+            turnId: z.string().min(1).optional(),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerThreadStartedStateNotificationSchema = z
+  .object({
+    method: z.literal("thread/started"),
+    params: z
+      .object({
+        thread: JsonValueSchema,
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerTurnThreadNotificationSchema = z
+  .object({
+    method: z.union([z.literal("turn/started"), z.literal("turn/completed")]),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turn: ThreadTurnSchema,
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerItemThreadNotificationSchema = z
+  .object({
+    method: z.union([z.literal("item/started"), z.literal("item/completed")]),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        item: TurnItemSchema,
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerItemDeltaBaseSchema = z
+  .object({
+    threadId: z.string().min(1),
+    turnId: z.string().min(1),
+    itemId: z.string().min(1),
+    delta: z.string(),
+  })
+  .passthrough();
+
+const AppServerAgentMessageDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/agentMessage/delta"),
+    params: AppServerItemDeltaBaseSchema,
+  })
+  .passthrough();
+
+const AppServerPlanDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/plan/delta"),
+    params: AppServerItemDeltaBaseSchema,
+  })
+  .passthrough();
+
+const AppServerCommandOutputDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/commandExecution/outputDelta"),
+    params: AppServerItemDeltaBaseSchema,
+  })
+  .passthrough();
+
+const AppServerReasoningTextDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/reasoning/textDelta"),
+    params: AppServerItemDeltaBaseSchema
+      .extend({
+        contentIndex: z.number().int().nonnegative(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerReasoningSummaryPartAddedNotificationSchema = z
+  .object({
+    method: z.literal("item/reasoning/summaryPartAdded"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        itemId: z.string().min(1),
+        summaryIndex: z.number().int().nonnegative(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerReasoningSummaryTextDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/reasoning/summaryTextDelta"),
+    params: AppServerItemDeltaBaseSchema
+      .extend({
+        summaryIndex: z.number().int().nonnegative(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerThreadTokenUsageUpdatedNotificationSchema = z
+  .object({
+    method: z.literal("thread/tokenUsage/updated"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        tokenUsage: JsonValueSchema,
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerThreadStatusChangedNotificationSchema = z
+  .object({
+    method: z.literal("thread/status/changed"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        status: ThreadStatusSchema,
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerThreadNameUpdatedNotificationSchema = z
+  .object({
+    method: z.literal("thread/name/updated"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        threadName: z.string().optional(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerTurnDiffUpdatedNotificationSchema = z
+  .object({
+    method: z.literal("turn/diff/updated"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        diff: z.string(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerTurnPlanStepSchema = z
+  .object({
+    step: z.string(),
+    status: z.string(),
+  })
+  .passthrough();
+
+const AppServerTurnPlanUpdatedNotificationSchema = z
+  .object({
+    method: z.literal("turn/plan/updated"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        explanation: z.union([z.string(), z.null()]),
+        plan: z.array(AppServerTurnPlanStepSchema),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerTerminalInteractionNotificationSchema = z
+  .object({
+    method: z.literal("item/commandExecution/terminalInteraction"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        itemId: z.string().min(1),
+        processId: z.string().min(1),
+        stdin: z.string(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerFileChangeOutputDeltaNotificationSchema = z
+  .object({
+    method: z.literal("item/fileChange/outputDelta"),
+    params: AppServerItemDeltaBaseSchema,
+  })
+  .passthrough();
+
+const AppServerMcpToolCallProgressNotificationSchema = z
+  .object({
+    method: z.literal("item/mcpToolCall/progress"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        itemId: z.string().min(1),
+        message: z.string(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerThreadCompactedNotificationSchema = z
+  .object({
+    method: z.literal("thread/compacted"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerModelReroutedNotificationSchema = z
+  .object({
+    method: z.literal("model/rerouted"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        fromModel: z.string(),
+        toModel: z.string(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+const AppServerErrorNotificationSchema = z
+  .object({
+    method: z.literal("error"),
+    params: z
+      .object({
+        threadId: z.string().min(1),
+        turnId: z.string().min(1),
+        willRetry: z.boolean(),
+        error: z
+          .object({
+            message: z.string(),
+            codexErrorInfo: JsonValueSchema.nullable(),
+            additionalDetails: z.union([z.string(), z.null()]),
+          })
+          .passthrough(),
+      })
+      .passthrough(),
+  })
+  .passthrough();
+
+function upsertTurnIntoThread(
+  thread: ThreadConversationState,
+  nextTurn: ThreadTurn,
+): ThreadConversationState {
+  const nextTurns = [...thread.turns];
+  const matchIndex = nextTurns.findIndex((turn) => turnsMatch(turn, nextTurn));
+  if (matchIndex === -1) {
+    nextTurns.push(nextTurn);
+  } else {
+    const currentTurn = nextTurns[matchIndex];
+    if (!currentTurn) {
+      return thread;
+    }
+    nextTurns[matchIndex] = {
+      ...currentTurn,
+      ...nextTurn,
+      params: nextTurn.params ?? currentTurn.params,
+      turnId: nextTurn.turnId ?? currentTurn.turnId,
+      id: nextTurn.id ?? currentTurn.id,
+      turnStartedAtMs:
+        nextTurn.turnStartedAtMs ?? currentTurn.turnStartedAtMs,
+      finalAssistantStartedAtMs:
+        nextTurn.finalAssistantStartedAtMs ??
+        currentTurn.finalAssistantStartedAtMs,
+      error: nextTurn.error ?? currentTurn.error,
+      diff: nextTurn.diff ?? currentTurn.diff,
+      items:
+        nextTurn.items.length > 0 ? nextTurn.items : currentTurn.items,
     };
   }
-
   return {
-    events: events.slice(latestSnapshotIndex),
-    hasSnapshot: true,
+    ...thread,
+    turns: nextTurns,
   };
+}
+
+function updateThreadTurn(
+  thread: ThreadConversationState,
+  turnId: string,
+  update: (turn: ThreadTurn) => ThreadTurn,
+): ThreadConversationState | null {
+  const nextTurns = [...thread.turns];
+  const turnIndex = nextTurns.findIndex((turn) => turnMatchesId(turn, turnId));
+  if (turnIndex === -1) {
+    return null;
+  }
+
+  const turn = nextTurns[turnIndex];
+  if (!turn) {
+    return null;
+  }
+
+  nextTurns[turnIndex] = update(turn);
+  return {
+    ...thread,
+    turns: nextTurns,
+  };
+}
+
+function updateThreadItem(
+  thread: ThreadConversationState,
+  turnId: string,
+  itemId: string,
+  update: (item: TurnItem) => TurnItem,
+): ThreadConversationState | null {
+  const nextTurns = [...thread.turns];
+  const turnIndex = nextTurns.findIndex((turn) => turnMatchesId(turn, turnId));
+  if (turnIndex === -1) {
+    return null;
+  }
+
+  const turn = nextTurns[turnIndex];
+  if (!turn) {
+    return null;
+  }
+
+  const nextItems = [...turn.items];
+  const itemIndex = nextItems.findIndex((item) => item.id === itemId);
+  if (itemIndex === -1) {
+    return null;
+  }
+
+  const currentItem = nextItems[itemIndex];
+  if (!currentItem) {
+    return null;
+  }
+
+  nextItems[itemIndex] = update(currentItem);
+  nextTurns[turnIndex] = {
+    ...turn,
+    items: nextItems,
+  };
+  return {
+    ...thread,
+    turns: nextTurns,
+  };
+}
+
+function upsertTurnItem(
+  thread: ThreadConversationState,
+  turnId: string,
+  nextItem: TurnItem,
+): ThreadConversationState | null {
+  const nextTurns = [...thread.turns];
+  const turnIndex = nextTurns.findIndex((turn) => turnMatchesId(turn, turnId));
+  if (turnIndex === -1) {
+    return null;
+  }
+
+  const turn = nextTurns[turnIndex];
+  if (!turn) {
+    return null;
+  }
+
+  const nextItems = [...turn.items];
+  const itemIndex = nextItems.findIndex((item) => item.id === nextItem.id);
+  if (itemIndex === -1) {
+    nextItems.push(nextItem);
+  } else {
+    nextItems[itemIndex] = nextItem;
+  }
+
+  nextTurns[turnIndex] = {
+    ...turn,
+    items: nextItems,
+  };
+  return {
+    ...thread,
+    turns: nextTurns,
+  };
+}
+
+function buildSyntheticTurnItemId(prefix: string, turnId: string): string {
+  return `${prefix}:${turnId}`;
+}
+
+function shouldBroadcastThreadSnapshotForAppServerNotification(
+  method: AppServerServerNotification["method"],
+): boolean {
+  switch (method) {
+    case "turn/plan/updated":
+    case "thread/compacted":
+    case "model/rerouted":
+    case "error":
+      return false;
+    default:
+      return true;
+  }
+}
+
+function turnMatchesId(turn: ThreadTurn, turnId: string): boolean {
+  return turn.turnId === turnId || turn.id === turnId;
+}
+
+function turnsMatch(left: ThreadTurn, right: ThreadTurn): boolean {
+  if (left.turnId && right.turnId) {
+    return left.turnId === right.turnId;
+  }
+  if (left.id && right.id) {
+    return left.id === right.id;
+  }
+  return false;
+}
+
+function extractIpcClientId(frame: IpcResponseFrame): string | null {
+  const parsed = z
+    .object({
+      result: z
+        .object({
+          clientId: z.string().min(1),
+        })
+        .passthrough()
+        .optional(),
+    })
+    .passthrough()
+    .safeParse(frame);
+  if (!parsed.success) {
+    return null;
+  }
+  return parsed.data.result?.clientId ?? null;
+}
+
+function extractThreadIdFromAppServerNotification(
+  notification: AppServerServerNotification,
+): string | null {
+  const directThreadId = AppServerThreadIdParamsSchema.safeParse(
+    notification.params,
+  );
+  if (directThreadId.success) {
+    return directThreadId.data.threadId;
+  }
+
+  const startedThread = AppServerThreadStartedNotificationSchema.safeParse(
+    notification,
+  );
+  if (startedThread.success) {
+    return startedThread.data.params.thread.id;
+  }
+
+  return null;
 }
 
 function extractThreadId(frame: IpcFrame): string | null {

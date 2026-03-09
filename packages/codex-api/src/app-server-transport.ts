@@ -1,24 +1,49 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import readline from "node:readline";
 import { randomUUID } from "node:crypto";
-import type { AppServerClientRequestMethod } from "@farfield/protocol";
+import readline from "node:readline";
 import {
-  AppServerRpcError,
-  AppServerTransportError
-} from "./errors.js";
-import { JsonRpcRequestSchema, parseJsonRpcIncomingMessage } from "./json-rpc.js";
+  type AppServerClientRequestMethod,
+  type AppServerServerNotification,
+  AppServerServerNotificationSchema,
+  type AppServerServerRequest,
+  AppServerServerRequestSchema
+} from "@farfield/protocol";
+import { z } from "zod";
+import { AppServerRpcError, AppServerTransportError } from "./errors.js";
+import {
+  JsonRpcErrorSchema,
+  JsonRpcNotificationSchema,
+  JsonRpcRequestSchema,
+  JsonRpcResponseSchema,
+  type JsonRpcRequest,
+  type JsonRpcResponse,
+  parseJsonRpcIncomingMessage
+} from "./json-rpc.js";
 
-export type AppServerRequestId = string | number;
+export type AppServerRequestId = JsonRpcRequest["id"];
+export type AppServerNotificationListener = (
+  notification: AppServerServerNotification
+) => void;
+export type AppServerRequestListener = (request: AppServerServerRequest) => void;
 
 export interface AppServerTransport {
-  request(method: AppServerClientRequestMethod, params: unknown, timeoutMs?: number): Promise<unknown>;
-  respond(requestId: AppServerRequestId, result: unknown): Promise<void>;
+  request(
+    method: AppServerClientRequestMethod,
+    params: JsonRpcRequest["params"],
+    timeoutMs?: number
+  ): Promise<JsonRpcResponse["result"]>;
+  respond(
+    requestId: AppServerRequestId,
+    result: JsonRpcResponse["result"]
+  ): Promise<void>;
+  onServerNotification(listener: AppServerNotificationListener): () => void;
+  onServerRequest(listener: AppServerRequestListener): () => void;
   close(): Promise<void>;
 }
 
 interface PendingRequest {
   timer: NodeJS.Timeout;
-  resolve: (value: unknown) => void;
+  resolve: (value: JsonRpcResponse["result"]) => void;
   reject: (error: Error) => void;
 }
 
@@ -29,6 +54,15 @@ export interface ChildProcessAppServerTransportOptions {
   env?: NodeJS.ProcessEnv;
   requestTimeoutMs?: number;
   onStderr?: (line: string) => void;
+  experimentalApi?: boolean;
+  optOutNotificationMethods?: string[];
+}
+
+function toErrorMessage(error: Error | string): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return error;
 }
 
 export class ChildProcessAppServerTransport implements AppServerTransport {
@@ -38,8 +72,14 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly requestTimeoutMs: number;
   private readonly onStderr: ((line: string) => void) | undefined;
+  private readonly experimentalApi: boolean;
+  private readonly optOutNotificationMethods: readonly string[];
+
   private process: ChildProcessWithoutNullStreams | null = null;
-  private readonly pending = new Map<number, PendingRequest>();
+  private readonly pending = new Map<AppServerRequestId, PendingRequest>();
+  private readonly serverNotificationListeners =
+    new Set<AppServerNotificationListener>();
+  private readonly serverRequestListeners = new Set<AppServerRequestListener>();
   private requestId = 0;
   private initialized = false;
   private initializeInFlight: Promise<void> | null = null;
@@ -51,6 +91,39 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     this.env = options.env;
     this.requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.onStderr = options.onStderr;
+    this.experimentalApi = options.experimentalApi ?? false;
+    this.optOutNotificationMethods = options.optOutNotificationMethods ?? [];
+  }
+
+  public onServerNotification(
+    listener: AppServerNotificationListener
+  ): () => void {
+    this.serverNotificationListeners.add(listener);
+    return () => {
+      this.serverNotificationListeners.delete(listener);
+    };
+  }
+
+  public onServerRequest(listener: AppServerRequestListener): () => void {
+    this.serverRequestListeners.add(listener);
+    return () => {
+      this.serverRequestListeners.delete(listener);
+    };
+  }
+
+  private async sendErrorResponse(
+    requestId: AppServerRequestId,
+    code: number,
+    message: string
+  ): Promise<void> {
+    const payload = JsonRpcResponseSchema.parse({
+      id: requestId,
+      error: {
+        code,
+        message
+      }
+    });
+    await this.writePayload(payload, "error response");
   }
 
   private ensureStarted(): void {
@@ -78,7 +151,9 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     });
 
     child.on("error", (error) => {
-      this.rejectAll(new AppServerTransportError(`app-server process error: ${error.message}`));
+      this.rejectAll(
+        new AppServerTransportError(`app-server process error: ${error.message}`)
+      );
       this.process = null;
       this.initialized = false;
       this.initializeInFlight = null;
@@ -91,33 +166,76 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
         return;
       }
 
-      const raw = JSON.parse(trimmed);
-      const message = parseJsonRpcIncomingMessage(raw);
+      try {
+        const raw = JSON.parse(trimmed);
+        const message = parseJsonRpcIncomingMessage(raw);
 
-      if (message.kind === "notification") {
-        return;
-      }
+        if (message.kind === "response") {
+          const pending = this.pending.get(message.value.id);
+          if (!pending) {
+            return;
+          }
 
-      const pending = this.pending.get(message.value.id);
-      if (!pending) {
-        return;
-      }
+          this.pending.delete(message.value.id);
+          clearTimeout(pending.timer);
 
-      this.pending.delete(message.value.id);
-      clearTimeout(pending.timer);
+          if (message.value.error) {
+            const responseError = JsonRpcErrorSchema.parse(message.value.error);
+            pending.reject(
+              new AppServerRpcError(
+                responseError.code,
+                responseError.message,
+                responseError.data
+              )
+            );
+            return;
+          }
 
-      if (message.value.error) {
-        pending.reject(
-          new AppServerRpcError(
-            message.value.error.code,
-            message.value.error.message,
-            message.value.error.data
+          pending.resolve(message.value.result);
+          return;
+        }
+
+        if (message.kind === "request") {
+          const parsedRequest = AppServerServerRequestSchema.safeParse(
+            message.value
+          );
+          if (!parsedRequest.success) {
+            void this.sendErrorResponse(
+              message.value.id,
+              -32600,
+              `Unhandled app-server request: ${message.value.method}`
+            ).catch(() => {});
+            return;
+          }
+
+          const request = parsedRequest.data;
+          for (const listener of this.serverRequestListeners) {
+            listener(request);
+          }
+          return;
+        }
+
+        const parsedNotification = AppServerServerNotificationSchema.safeParse(
+          message.value
+        );
+        if (!parsedNotification.success) {
+          return;
+        }
+
+        const notification = parsedNotification.data;
+        for (const listener of this.serverNotificationListeners) {
+          listener(notification);
+        }
+      } catch (error) {
+        const messageText = toErrorMessage(
+          error instanceof Error ? error : String(error)
+        );
+        this.rejectAll(
+          new AppServerTransportError(
+            `failed to process app-server message: ${messageText}`
           )
         );
-        return;
       }
-
-      pending.resolve(message.value.result);
     });
 
     const stderrReader = readline.createInterface({ input: child.stderr });
@@ -141,39 +259,64 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     this.pending.clear();
   }
 
-  private async sendRequest(
-    method: AppServerClientRequestMethod,
-    params: unknown,
-    timeoutMs?: number
-  ): Promise<unknown> {
+  private async writePayload(
+    payload:
+      | JsonRpcRequest
+      | z.output<typeof JsonRpcNotificationSchema>
+      | z.output<typeof JsonRpcResponseSchema>,
+    context: string
+  ): Promise<void> {
     const processHandle = this.process;
     if (!processHandle) {
       throw new AppServerTransportError("app-server failed to start");
     }
 
+    const encoded = `${JSON.stringify(payload)}\n`;
+    await new Promise<void>((resolve, reject) => {
+      processHandle.stdin.write(encoded, (error) => {
+        if (!error) {
+          resolve();
+          return;
+        }
+
+        reject(
+          new AppServerTransportError(
+            `failed to write app-server ${context}: ${error.message}`
+          )
+        );
+      });
+    });
+  }
+
+  private async sendNotification(method: "initialized"): Promise<void> {
+    const payload = JsonRpcNotificationSchema.parse({ method });
+    await this.writePayload(payload, "notification");
+  }
+
+  private async sendRequest(
+    method: AppServerClientRequestMethod,
+    params: JsonRpcRequest["params"],
+    timeoutMs?: number
+  ): Promise<JsonRpcResponse["result"]> {
     const id = ++this.requestId;
     const timeout = timeoutMs ?? this.requestTimeoutMs;
     const requestPayload = JsonRpcRequestSchema.parse({
-      jsonrpc: "2.0",
       id,
       method,
-      params
+      ...(params !== undefined ? { params } : {})
     });
-    const encoded = JSON.stringify(requestPayload) + "\n";
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new AppServerTransportError(`app-server request timed out: ${method}`));
+        reject(
+          new AppServerTransportError(`app-server request timed out: ${method}`)
+        );
       }, timeout);
 
       this.pending.set(id, { timer, resolve, reject });
 
-      processHandle.stdin.write(encoded, (error) => {
-        if (!error) {
-          return;
-        }
-
+      void this.writePayload(requestPayload, "request").catch((error) => {
         const pending = this.pending.get(id);
         if (!pending) {
           return;
@@ -181,7 +324,7 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
 
         clearTimeout(pending.timer);
         this.pending.delete(id);
-        pending.reject(new AppServerTransportError(`failed to write app-server request: ${error.message}`));
+        pending.reject(error);
       });
     });
   }
@@ -196,24 +339,28 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     }
 
     this.initializeInFlight = (async () => {
-      const result = await this.sendRequest(
+      const capabilities = {
+        ...(this.experimentalApi ? { experimentalApi: true } : {}),
+        ...(this.optOutNotificationMethods.length > 0
+          ? {
+              optOutNotificationMethods: [...this.optOutNotificationMethods]
+            }
+          : {})
+      };
+
+      await this.sendRequest(
         "initialize",
         {
           clientInfo: {
             name: "farfield",
             version: "0.2.0"
           },
-          capabilities: {
-            experimentalApi: true
-          }
+          ...(Object.keys(capabilities).length > 0 ? { capabilities } : {})
         },
         this.requestTimeoutMs
       );
 
-      if (!result || typeof result !== "object") {
-        throw new AppServerTransportError("app-server initialize returned invalid result");
-      }
-
+      await this.sendNotification("initialized");
       this.initialized = true;
     })().finally(() => {
       this.initializeInFlight = null;
@@ -224,9 +371,9 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
 
   public async request(
     method: AppServerClientRequestMethod,
-    params: unknown,
+    params: JsonRpcRequest["params"],
     timeoutMs?: number
-  ): Promise<unknown> {
+  ): Promise<JsonRpcResponse["result"]> {
     this.ensureStarted();
 
     if (method !== "initialize") {
@@ -240,31 +387,18 @@ export class ChildProcessAppServerTransport implements AppServerTransport {
     return result;
   }
 
-  public async respond(requestId: AppServerRequestId, result: unknown): Promise<void> {
+  public async respond(
+    requestId: AppServerRequestId,
+    result: JsonRpcResponse["result"]
+  ): Promise<void> {
     this.ensureStarted();
     await this.ensureInitialized();
 
-    const processHandle = this.process;
-    if (!processHandle) {
-      throw new AppServerTransportError("app-server failed to start");
-    }
-
-    const encoded =
-      JSON.stringify({
-        jsonrpc: "2.0",
-        id: requestId,
-        result
-      }) + "\n";
-
-    await new Promise<void>((resolve, reject) => {
-      processHandle.stdin.write(encoded, (error) => {
-        if (!error) {
-          resolve();
-          return;
-        }
-        reject(new AppServerTransportError(`failed to write app-server response: ${error.message}`));
-      });
+    const payload = JsonRpcResponseSchema.parse({
+      id: requestId,
+      ...(result !== undefined ? { result } : { result: null })
     });
+    await this.writePayload(payload, "response");
   }
 
   public async close(): Promise<void> {

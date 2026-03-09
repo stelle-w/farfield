@@ -4,13 +4,13 @@ export function resolveOwnerClientId(
   override?: string,
   globalOwnerClientId?: string,
 ): string {
+  if (override && override.trim()) {
+    return override.trim();
+  }
+
   const mapped = threadOwnerById.get(threadId);
   if (mapped && mapped.trim()) {
     return mapped.trim();
-  }
-
-  if (override && override.trim()) {
-    return override.trim();
   }
 
   if (globalOwnerClientId && globalOwnerClientId.trim()) {

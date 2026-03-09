@@ -280,6 +280,33 @@ function createHandlerTable(
           ? { ownerClientId: command.ownerClientId }
           : {}),
         ...(command.cwd ? { cwd: command.cwd } : {}),
+        ...(command.model ? { model: command.model } : {}),
+        ...(command.effort ? { effort: command.effort } : {}),
+        ...(command.collaborationMode
+          ? {
+              collaborationMode: {
+                mode: command.collaborationMode.mode,
+                settings: {
+                  model: command.collaborationMode.settings.model,
+                  ...(command.collaborationMode.settings.reasoningEffort !==
+                  undefined
+                    ? {
+                        reasoning_effort:
+                          command.collaborationMode.settings.reasoningEffort
+                      }
+                    : {}),
+                  ...(command.collaborationMode.settings
+                    .developerInstructions !== undefined
+                    ? {
+                        developer_instructions:
+                          command.collaborationMode.settings
+                            .developerInstructions
+                      }
+                    : {})
+                }
+              }
+            }
+          : {}),
         ...(typeof command.isSteering === "boolean"
           ? { isSteering: command.isSteering }
           : {}),
@@ -369,9 +396,7 @@ function createHandlerTable(
         collaborationMode: {
           mode: command.collaborationMode.mode,
           settings: {
-            ...(command.collaborationMode.settings.model !== undefined
-              ? { model: command.collaborationMode.settings.model }
-              : {}),
+            model: command.collaborationMode.settings.model,
             ...(command.collaborationMode.settings.reasoningEffort !== undefined
               ? {
                   reasoning_effort:
@@ -616,7 +641,7 @@ function parseThreadWaitingState(
   };
 }
 
-function mapThread(
+export function mapThread(
   provider: UnifiedProviderId,
   thread: ThreadConversationState,
 ): UnifiedThread {
@@ -886,6 +911,54 @@ function normalizeUnixTimestampSeconds(value: number): number {
   return Math.floor(value);
 }
 
+type ThreadUserMessageItem = Extract<
+  ThreadConversationState["turns"][number]["items"][number],
+  { type: "userMessage" | "steeringUserMessage" }
+>;
+
+type ThreadUserMessagePart = ThreadUserMessageItem["content"][number];
+
+type UnifiedUserMessagePart = Extract<
+  UnifiedItem,
+  { type: "userMessage" | "steeringUserMessage" }
+>["content"][number];
+
+function mapInputPart(
+  part: ThreadUserMessagePart,
+): UnifiedUserMessagePart {
+  switch (part.type) {
+    case "text":
+      return {
+        type: "text",
+        text: part.text,
+      };
+    case "image":
+      return {
+        type: "image",
+        url: part.url,
+      };
+    case "localImage":
+      return {
+        type: "localImage",
+        path: part.path,
+      };
+    case "skill":
+      return {
+        type: "skill",
+        name: part.name,
+        path: part.path,
+      };
+    case "mention":
+      return {
+        type: "mention",
+        name: part.name,
+        path: part.path,
+      };
+    default:
+      return assertNever(part);
+  }
+}
+
 function mapTurnItem(
   item: ThreadConversationState["turns"][number]["items"][number],
 ): UnifiedItem {
@@ -894,22 +967,14 @@ function mapTurnItem(
       return {
         id: item.id,
         type: "userMessage",
-        content: item.content.map((part) =>
-          part.type === "text"
-            ? { type: "text", text: part.text }
-            : { type: "image", url: part.url },
-        ),
+        content: item.content.map(mapInputPart),
       };
 
     case "steeringUserMessage":
       return {
         id: item.id,
         type: "steeringUserMessage",
-        content: item.content.map((part) =>
-          part.type === "text"
-            ? { type: "text", text: part.text }
-            : { type: "image", url: part.url },
-        ),
+        content: item.content.map(mapInputPart),
         ...(item.attachments
           ? {
               attachments: item.attachments.map((attachment) =>
@@ -1019,7 +1084,9 @@ function mapTurnItem(
                   : {}),
                 ...(action.name !== undefined ? { name: action.name } : {}),
                 ...(action.path !== undefined ? { path: action.path } : {}),
-                ...(action.query !== undefined ? { query: action.query } : {}),
+                ...(action.query !== undefined && action.query !== null
+                  ? { query: action.query }
+                  : {}),
               })),
             }
           : {}),
@@ -1063,15 +1130,43 @@ function mapTurnItem(
         id: item.id,
         type: "webSearch",
         query: item.query,
-        action: {
-          type: item.action.type,
-          ...(item.action.query !== undefined
-            ? { query: item.action.query }
-            : {}),
-          ...(item.action.queries !== undefined
-            ? { queries: item.action.queries }
-            : {}),
-        },
+        ...(item.action !== undefined
+          ? {
+              action:
+                item.action === null
+                  ? null
+                  : item.action.type === "search"
+                    ? {
+                        type: "search" as const,
+                        ...(item.action.query !== undefined
+                          ? { query: item.action.query }
+                          : {}),
+                        ...(item.action.queries !== undefined
+                          ? { queries: item.action.queries }
+                          : {}),
+                      }
+                    : item.action.type === "openPage"
+                      ? {
+                          type: "openPage" as const,
+                          ...(item.action.url !== undefined
+                            ? { url: item.action.url }
+                            : {}),
+                        }
+                      : item.action.type === "findInPage"
+                        ? {
+                            type: "findInPage" as const,
+                            ...(item.action.url !== undefined
+                              ? { url: item.action.url }
+                              : {}),
+                            ...(item.action.pattern !== undefined
+                              ? { pattern: item.action.pattern }
+                              : {}),
+                          }
+                        : {
+                            type: "other" as const,
+                          },
+            }
+          : {}),
       };
 
     case "mcpToolCall":
@@ -1106,6 +1201,37 @@ function mapTurnItem(
         ...(item.error !== undefined
           ? { error: item.error ? { message: item.error.message } : null }
           : {}),
+        ...(item.durationMs !== undefined
+          ? { durationMs: item.durationMs }
+          : {}),
+      };
+
+    case "dynamicToolCall":
+      return {
+        id: item.id,
+        type: "dynamicToolCall",
+        tool: item.tool,
+        arguments: jsonValueFromString(JSON.stringify(item.arguments)),
+        status: item.status,
+        ...(item.contentItems !== undefined
+          ? {
+              contentItems:
+                item.contentItems === null
+                  ? null
+                  : item.contentItems.map((contentItem) =>
+                      contentItem.type === "inputText"
+                        ? {
+                            type: "inputText" as const,
+                            text: contentItem.text,
+                          }
+                        : {
+                            type: "inputImage" as const,
+                            imageUrl: contentItem.imageUrl,
+                          },
+                    ),
+            }
+          : {}),
+        ...(item.success !== undefined ? { success: item.success } : {}),
         ...(item.durationMs !== undefined
           ? { durationMs: item.durationMs }
           : {}),

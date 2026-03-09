@@ -79,6 +79,47 @@ const HealthResponseSchema = z
         lastError: z.string().nullable(),
         historyCount: z.number().int().nonnegative(),
         threadOwnerCount: z.number().int().nonnegative(),
+        timings: z
+          .object({
+            realtimeCoreBuild: z
+              .object({
+                count: z.number().int().nonnegative(),
+                slowCount: z.number().int().nonnegative(),
+                lastMs: z.number().nonnegative(),
+                avgMs: z.number().nonnegative(),
+                maxMs: z.number().nonnegative(),
+              })
+              .strict(),
+            realtimeThreadBuild: z
+              .object({
+                count: z.number().int().nonnegative(),
+                slowCount: z.number().int().nonnegative(),
+                lastMs: z.number().nonnegative(),
+                avgMs: z.number().nonnegative(),
+                maxMs: z.number().nonnegative(),
+              })
+              .strict(),
+            codexThreadRefresh: z
+              .object({
+                count: z.number().int().nonnegative(),
+                slowCount: z.number().int().nonnegative(),
+                lastMs: z.number().nonnegative(),
+                avgMs: z.number().nonnegative(),
+                maxMs: z.number().nonnegative(),
+              })
+              .strict(),
+            codexLiveStateRead: z
+              .object({
+                count: z.number().int().nonnegative(),
+                slowCount: z.number().int().nonnegative(),
+                lastMs: z.number().nonnegative(),
+                avgMs: z.number().nonnegative(),
+                maxMs: z.number().nonnegative(),
+              })
+              .strict(),
+          })
+          .strict()
+          .optional(),
       })
       .passthrough(),
   })
@@ -800,6 +841,16 @@ export async function sendMessage(input: {
   ownerClientId?: string;
   text: string;
   cwd?: string;
+  model?: string;
+  effort?: string;
+  collaborationMode?: {
+    mode: string;
+    settings: {
+      model: string;
+      reasoningEffort?: string | null;
+      developerInstructions?: string | null;
+    };
+  };
   isSteering?: boolean;
 }): Promise<void> {
   const result = await runUnifiedCommand({
@@ -809,6 +860,32 @@ export async function sendMessage(input: {
     text: input.text,
     ...(input.ownerClientId ? { ownerClientId: input.ownerClientId } : {}),
     ...(input.cwd ? { cwd: input.cwd } : {}),
+    ...(input.model ? { model: input.model } : {}),
+    ...(input.effort ? { effort: input.effort } : {}),
+    ...(input.collaborationMode
+        ? {
+            collaborationMode: {
+              mode: input.collaborationMode.mode,
+              settings: {
+                model: input.collaborationMode.settings.model,
+              ...(input.collaborationMode.settings.reasoningEffort !==
+              undefined
+                ? {
+                    reasoningEffort:
+                      input.collaborationMode.settings.reasoningEffort
+                  }
+                : {}),
+              ...(input.collaborationMode.settings.developerInstructions !==
+              undefined
+                ? {
+                    developerInstructions:
+                      input.collaborationMode.settings.developerInstructions
+                  }
+                : {})
+            }
+          }
+        }
+      : {}),
     ...(typeof input.isSteering === "boolean"
       ? { isSteering: input.isSteering }
       : {}),
@@ -826,7 +903,7 @@ export async function setCollaborationMode(input: {
   collaborationMode: {
     mode: string;
     settings: {
-      model?: string | null;
+      model: string;
       reasoningEffort?: string | null;
       developerInstructions?: string | null;
     };
@@ -840,9 +917,7 @@ export async function setCollaborationMode(input: {
     collaborationMode: {
       mode: input.collaborationMode.mode,
       settings: {
-        ...(input.collaborationMode.settings.model !== undefined
-          ? { model: input.collaborationMode.settings.model }
-          : {}),
+        model: input.collaborationMode.settings.model,
         ...(input.collaborationMode.settings.reasoningEffort !== undefined
           ? {
               reasoningEffort: input.collaborationMode.settings.reasoningEffort,
