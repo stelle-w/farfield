@@ -575,7 +575,7 @@ function mapThreadSummary(
     createdAt: number;
     updatedAt: number;
     cwd?: string | undefined;
-    source?: JsonValue | undefined;
+    source?: string | number | boolean | object | null | undefined;
   },
 ): UnifiedThreadSummary {
   const waitingState = parseThreadWaitingState(thread.status);
@@ -715,7 +715,9 @@ function mapThread(
   };
 }
 
-function normalizeThreadSource(source: JsonValue | undefined): string | null {
+function normalizeThreadSource(
+  source: string | number | boolean | object | null | undefined,
+): string | null {
   if (typeof source === "string") {
     return source;
   }
@@ -978,7 +980,11 @@ function mapTurnItem(
         ...(typeof item.willRetry === "boolean"
           ? { willRetry: item.willRetry }
           : {}),
-        ...(item.errorInfo !== undefined ? { errorInfo: item.errorInfo } : {}),
+        ...(item.errorInfo !== undefined
+          ? {
+              errorInfo: jsonValueFromString(JSON.stringify(item.errorInfo)),
+            }
+          : {}),
         ...(item.additionalDetails !== undefined
           ? {
               additionalDetails: jsonValueFromString(
