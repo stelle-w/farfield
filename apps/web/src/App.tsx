@@ -11,6 +11,7 @@ import {
 import {
   Activity,
   Bug,
+  Check,
   Circle,
   CircleDot,
   Folder,
@@ -229,6 +230,8 @@ interface ThreadNotificationSnapshot {
   isGenerating: boolean;
   waitingOnUserInput: boolean;
 }
+
+const THREAD_COMPLETION_BADGE_DURATION_MS = 12_000;
 
 /* ── Helpers ────────────────────────────────────────────────── */
 function formatCompactRelativeTime(
@@ -1257,6 +1260,9 @@ export function App(): React.JSX.Element {
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
   const [notificationPreferences, setNotificationPreferences] =
     useState<NotificationPreferences>(() => readNotificationPreferences());
+  const [recentlyCompletedThreadIds, setRecentlyCompletedThreadIds] = useState<
+    Set<string>
+  >(() => new Set());
 
   /* UI state */
   const [activeTab, setActiveTab] = useState<"chat" | "debug">(
@@ -1347,6 +1353,7 @@ export function App(): React.JSX.Element {
     Map<string, ThreadNotificationSnapshot>
   >(new Map());
   const hasHydratedThreadNotificationStateRef = useRef(false);
+  const completionBadgeTimeoutsRef = useRef<Map<string, number>>(new Map());
 
   /* Derived */
   const selectedThread = useMemo(
@@ -2705,6 +2712,15 @@ export function App(): React.JSX.Element {
   }, [notificationPreferences]);
 
   useEffect(() => {
+    return () => {
+      for (const timeoutId of completionBadgeTimeoutsRef.current.values()) {
+        window.clearTimeout(timeoutId);
+      }
+      completionBadgeTimeoutsRef.current.clear();
+    };
+  }, []);
+
+  useEffect(() => {
     const nextSnapshot = new Map<string, ThreadNotificationSnapshot>(
       threads.map((thread) => [
         thread.id,
@@ -2733,6 +2749,43 @@ export function App(): React.JSX.Element {
 
       if (previousState.isGenerating && !nextState.isGenerating) {
         shouldPlayCompletionSound = true;
+        const existingTimeoutId =
+          completionBadgeTimeoutsRef.current.get(threadId) ?? null;
+        if (existingTimeoutId !== null) {
+          window.clearTimeout(existingTimeoutId);
+        }
+        setRecentlyCompletedThreadIds((current) => {
+          const next = new Set(current);
+          next.add(threadId);
+          return next;
+        });
+        const timeoutId = window.setTimeout(() => {
+          completionBadgeTimeoutsRef.current.delete(threadId);
+          setRecentlyCompletedThreadIds((current) => {
+            if (!current.has(threadId)) {
+              return current;
+            }
+            const next = new Set(current);
+            next.delete(threadId);
+            return next;
+          });
+        }, THREAD_COMPLETION_BADGE_DURATION_MS);
+        completionBadgeTimeoutsRef.current.set(threadId, timeoutId);
+      } else if (nextState.isGenerating) {
+        const existingTimeoutId =
+          completionBadgeTimeoutsRef.current.get(threadId) ?? null;
+        if (existingTimeoutId !== null) {
+          window.clearTimeout(existingTimeoutId);
+          completionBadgeTimeoutsRef.current.delete(threadId);
+        }
+        setRecentlyCompletedThreadIds((current) => {
+          if (!current.has(threadId)) {
+            return current;
+          }
+          const next = new Set(current);
+          next.delete(threadId);
+          return next;
+        });
       }
       if (
         !previousState.waitingOnUserInput &&
@@ -4084,6 +4137,10 @@ export function App(): React.JSX.Element {
                             : Boolean(thread.waitingOnUserInput);
                         const hasWaitingIndicator =
                           waitingOnApproval || waitingOnUserInput;
+                        const showCompletedIndicator =
+                          !threadIsGenerating &&
+                          !hasWaitingIndicator &&
+                          recentlyCompletedThreadIds.has(thread.id);
                         return (
                           <Button
                             key={thread.id}
@@ -4127,6 +4184,12 @@ export function App(): React.JSX.Element {
                                 waitingOnApproval={waitingOnApproval}
                                 waitingOnUserInput={waitingOnUserInput}
                               />
+                              {showCompletedIndicator && (
+                                <span className="shrink-0 inline-flex items-center gap-1 rounded-full border border-emerald-500/35 bg-emerald-500/12 px-1.5 py-px text-[9px] font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300">
+                                  <Check size={9} />
+                                  Done
+                                </span>
+                              )}
                               {!hasWaitingIndicator && threadIsGenerating && (
                                 <Loader2
                                   size={11}
