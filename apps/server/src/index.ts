@@ -34,6 +34,7 @@ import {
 
 const HOST = process.env["HOST"] ?? "127.0.0.1";
 const PORT = Number(process.env["PORT"] ?? 4311);
+const API_KEY = process.env["FARFIELD_API_KEY"]?.trim() ?? "";
 const HISTORY_LIMIT = 2_000;
 const USER_AGENT = "farfield/0.2.2";
 const IPC_RECONNECT_DELAY_MS = 1_000;
@@ -150,10 +151,39 @@ function jsonResponse(
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": encoded.length,
     "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "content-type",
+    "Access-Control-Allow-Headers": "content-type,authorization,x-api-key",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
   });
   res.end(encoded);
+}
+
+function getRequestApiKey(req: IncomingMessage, url: URL): string {
+  const authorization = req.headers["authorization"];
+  if (typeof authorization === "string") {
+    const trimmed = authorization.trim();
+    if (trimmed.toLowerCase().startsWith("bearer ")) {
+      return trimmed.slice(7).trim();
+    }
+  }
+
+  const xApiKey = req.headers["x-api-key"];
+  if (typeof xApiKey === "string" && xApiKey.trim().length > 0) {
+    return xApiKey.trim();
+  }
+
+  const accessToken = url.searchParams.get("access_token");
+  if (typeof accessToken === "string" && accessToken.trim().length > 0) {
+    return accessToken.trim();
+  }
+
+  return "";
+}
+
+function isAuthorizedRequest(req: IncomingMessage, url: URL): boolean {
+  if (API_KEY.length === 0) {
+    return true;
+  }
+  return getRequestApiKey(req, url) === API_KEY;
 }
 
 function eventResponse(res: ServerResponse, body: unknown): void {
@@ -500,6 +530,14 @@ const server = http.createServer(async (req, res) => {
     const pathname = url.pathname;
     const segments = pathname.split("/").filter(Boolean);
 
+    if (pathname.startsWith("/api/") && !isAuthorizedRequest(req, url)) {
+      jsonResponse(res, 401, {
+        ok: false,
+        error: "Unauthorized",
+      });
+      return;
+    }
+
     if (req.method === "GET" && pathname === "/api/health") {
       jsonResponse(res, 200, {
         ok: true,
@@ -515,6 +553,7 @@ const server = http.createServer(async (req, res) => {
         Connection: "keep-alive",
         "X-Accel-Buffering": "no",
         "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers": "content-type,authorization,x-api-key",
       });
       res.write("retry: 1000\n\n");
 

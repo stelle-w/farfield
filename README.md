@@ -122,6 +122,14 @@ If you need a custom backend origin for API proxying:
 FARFIELD_API_ORIGIN=http://127.0.0.1:4311 bun run start
 ```
 
+If you want to protect the backend with a shared API key:
+
+```bash
+FARFIELD_API_KEY=your-long-random-secret bun run --filter @farfield/server dev
+```
+
+Then set the same API key in the frontend Settings modal. Regular API requests are sent with an Authorization header, and the live event stream sends the same key as an `access_token` query parameter.
+
 ### React Compiler and production profiling
 
 Frontend build supports optional flags:

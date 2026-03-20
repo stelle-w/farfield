@@ -39,9 +39,11 @@ import {
   getPendingThreadRequests,
   getPendingUserInputRequests,
   getSavedServerBaseUrl,
+  getServerApiKey,
   getServerBaseUrl,
   getStreamEvents,
   getUnifiedEventsUrl,
+  normalizeApiKey,
   readThread,
   getTraceStatus,
   interruptThread,
@@ -51,12 +53,12 @@ import {
   listDebugHistory,
   listSidebarThreads,
   markTrace,
+  saveServerConnectionSettings,
   sendMessage,
   setCollaborationMode,
   startTrace,
   stopTrace,
   submitUserInput,
-  setServerBaseUrl,
   type AgentId,
 } from "@/lib/api";
 import {
@@ -1137,6 +1139,12 @@ export function App(): React.JSX.Element {
     useState<string>(initialServerBaseUrl);
   const [serverBaseUrlDraft, setServerBaseUrlDraft] =
     useState<string>(initialServerBaseUrl);
+  const [serverApiKey, setServerApiKeyState] = useState<string>(() =>
+    getServerApiKey(),
+  );
+  const [serverApiKeyDraft, setServerApiKeyDraft] = useState<string>(() =>
+    getServerApiKey(),
+  );
   const [hasSavedServerTarget, setHasSavedServerTarget] = useState<boolean>(
     initialHasSavedServerBaseUrl,
   );
@@ -1255,11 +1263,12 @@ export function App(): React.JSX.Element {
   );
   const selectedAgentLabel = selectedAgentDescriptor?.label ?? "Agent";
   const reversedHistory = useMemo(() => history.slice().reverse(), [history]);
-  const hasServerBaseUrlDraftChanges =
-    serverBaseUrlDraft.trim() !== serverBaseUrl;
+  const hasServerConnectionDraftChanges =
+    serverBaseUrlDraft.trim() !== serverBaseUrl ||
+    serverApiKeyDraft !== serverApiKey;
   const unifiedEventsUrl = useMemo(
     () => getUnifiedEventsUrl(serverBaseUrl),
-    [serverBaseUrl],
+    [serverBaseUrl, serverApiKey],
   );
   const upsertSidebarThread = useCallback((threadSummary: Thread) => {
     setThreads((previousThreads) => {
@@ -2301,9 +2310,14 @@ export function App(): React.JSX.Element {
   const saveServerTarget = useCallback(async () => {
     try {
       setError("");
-      const normalizedBaseUrl = setServerBaseUrl(serverBaseUrlDraft);
-      setServerBaseUrlState(normalizedBaseUrl);
-      setServerBaseUrlDraft(normalizedBaseUrl);
+      const saved = saveServerConnectionSettings({
+        baseUrl: serverBaseUrlDraft,
+        apiKey: serverApiKeyDraft,
+      });
+      setServerBaseUrlState(saved.baseUrl);
+      setServerBaseUrlDraft(saved.baseUrl);
+      setServerApiKeyState(saved.apiKey);
+      setServerApiKeyDraft(saved.apiKey);
       setHasSavedServerTarget(true);
       agentCacheRef.current = null;
       providerCatalogCacheRef.current.clear();
@@ -2311,7 +2325,7 @@ export function App(): React.JSX.Element {
     } catch (e) {
       setError(toErrorMessage(e));
     }
-  }, [refreshAll, serverBaseUrlDraft]);
+  }, [refreshAll, serverApiKeyDraft, serverBaseUrlDraft]);
 
   const useDefaultServerTarget = useCallback(async () => {
     try {
@@ -2320,6 +2334,8 @@ export function App(): React.JSX.Element {
       const defaultBaseUrl = getDefaultServerBaseUrl();
       setServerBaseUrlState(defaultBaseUrl);
       setServerBaseUrlDraft(defaultBaseUrl);
+      setServerApiKeyState("");
+      setServerApiKeyDraft("");
       setHasSavedServerTarget(false);
       agentCacheRef.current = null;
       providerCatalogCacheRef.current.clear();
@@ -4795,7 +4811,7 @@ export function App(): React.JSX.Element {
                 <div className="space-y-1.5">
                   <Label className="text-sm font-medium">Server</Label>
                   <div className="text-xs text-muted-foreground">
-                    Use your Tailscale HTTPS URL.
+                    Use your HTTPS server URL. If the backend requires auth, add an API key below.
                   </div>
                   <Input
                     value={serverBaseUrlDraft}
@@ -4806,7 +4822,27 @@ export function App(): React.JSX.Element {
                         void saveServerTarget();
                       }
                     }}
-                    placeholder="https://your-vpn-server.example.com"
+                    placeholder="https://your-server.example.com"
+                    className="h-9 text-sm"
+                  />
+                </div>
+
+                <div className="space-y-1.5">
+                  <Label className="text-sm font-medium">API key</Label>
+                  <div className="text-xs text-muted-foreground">
+                    Stored in this browser and sent to the backend on API requests.
+                  </div>
+                  <Input
+                    type="password"
+                    value={serverApiKeyDraft}
+                    onChange={(e) => setServerApiKeyDraft(normalizeApiKey(e.target.value))}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void saveServerTarget();
+                      }
+                    }}
+                    placeholder="Optional API key"
                     className="h-9 text-sm"
                   />
                 </div>
@@ -4821,7 +4857,7 @@ export function App(): React.JSX.Element {
                     className="h-8 text-xs"
                     disabled={
                       serverBaseUrlDraft.trim().length === 0 ||
-                      !hasServerBaseUrlDraftChanges
+                      !hasServerConnectionDraftChanges
                     }
                   >
                     Save
@@ -4846,6 +4882,9 @@ export function App(): React.JSX.Element {
                   {hasSavedServerTarget
                     ? "Saved server target"
                     : "Automatic server target"}
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  API key: {serverApiKey ? "Saved" : "Not set"}
                 </div>
               </div>
             </motion.div>
