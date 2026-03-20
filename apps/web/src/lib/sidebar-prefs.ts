@@ -4,6 +4,12 @@ const STORAGE_PREFIX = "farfield.sidebar";
 
 const SidebarOrderSchema = z.array(z.string());
 const SidebarCollapseMapSchema = z.record(z.string(), z.boolean());
+const NotificationPreferencesSchema = z
+  .object({
+    playCompletionSound: z.boolean(),
+    playUserInputSound: z.boolean(),
+  })
+  .strict();
 
 const GROUP_COLORS = [
   "#ef4444", "#f97316", "#eab308", "#22c55e",
@@ -55,4 +61,28 @@ export function readProjectColors(): Record<string, GroupColor> {
 
 export function writeProjectColors(map: Record<string, GroupColor>): void {
   writeStorage("project-colors.v1", map);
+}
+
+export interface NotificationPreferences {
+  playCompletionSound: boolean;
+  playUserInputSound: boolean;
+}
+
+const DEFAULT_NOTIFICATION_PREFERENCES: NotificationPreferences = {
+  playCompletionSound: false,
+  playUserInputSound: false,
+};
+
+export function readNotificationPreferences(): NotificationPreferences {
+  return readStorage(
+    "notification-preferences.v1",
+    NotificationPreferencesSchema,
+    DEFAULT_NOTIFICATION_PREFERENCES,
+  );
+}
+
+export function writeNotificationPreferences(
+  value: NotificationPreferences,
+): void {
+  writeStorage("notification-preferences.v1", value);
 }

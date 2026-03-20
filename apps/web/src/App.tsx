@@ -64,10 +64,13 @@ import {
 import {
   groupColors,
   readCollapseMap,
+  readNotificationPreferences,
   readProjectColors,
   readSidebarOrder,
+  type NotificationPreferences,
   type GroupColor,
   writeCollapseMap,
+  writeNotificationPreferences,
   writeProjectColors,
   writeSidebarOrder,
 } from "@/lib/sidebar-prefs";
@@ -87,6 +90,7 @@ import { PendingRequestCard } from "@/components/PendingRequestCard";
 import { SidebarThreadWaitingIndicators } from "@/components/SidebarThreadWaitingIndicators";
 import { StreamEventCard } from "@/components/StreamEventCard";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -219,6 +223,11 @@ interface MobileSidebarSwipeGesture {
   mode: "open" | "close";
   startX: number;
   startY: number;
+}
+
+interface ThreadNotificationSnapshot {
+  isGenerating: boolean;
+  waitingOnUserInput: boolean;
 }
 
 /* ── Helpers ────────────────────────────────────────────────── */
@@ -452,6 +461,55 @@ function mergeIncomingThreads(
   return sortThreadsByRecency(merged);
 }
 
+function deriveThreadActivityFromCachedState(
+  cachedState: CachedThreadViewState | null,
+): {
+  isGenerating: boolean;
+  waitingOnApproval: boolean;
+  waitingOnUserInput: boolean;
+} | null {
+  if (!cachedState) {
+    return null;
+  }
+
+  const conversationState =
+    cachedState.liveState?.conversationState ??
+    cachedState.readThreadState?.thread ??
+    null;
+  if (!conversationState) {
+    return null;
+  }
+
+  return {
+    isGenerating: isThreadGeneratingState(conversationState),
+    waitingOnApproval: getPendingApprovalRequests(conversationState).length > 0,
+    waitingOnUserInput: getPendingUserInputRequests(conversationState).length > 0,
+  };
+}
+
+function mergeThreadSummaryWithCachedState(
+  thread: Thread,
+  cachedState: CachedThreadViewState | null,
+): Thread {
+  const cachedActivity = deriveThreadActivityFromCachedState(cachedState);
+  if (!cachedActivity) {
+    return thread;
+  }
+
+  return {
+    ...thread,
+    ...(thread.isGenerating === undefined
+      ? { isGenerating: cachedActivity.isGenerating }
+      : {}),
+    ...(thread.waitingOnApproval === undefined
+      ? { waitingOnApproval: cachedActivity.waitingOnApproval }
+      : {}),
+    ...(thread.waitingOnUserInput === undefined
+      ? { waitingOnUserInput: cachedActivity.waitingOnUserInput }
+      : {}),
+  };
+}
+
 function toErrorMessage(err: unknown): string {
   if (err instanceof Error) {
     return err.message;
@@ -543,6 +601,48 @@ function isThreadGeneratingState(
   }
   const lastTurn = state.turns[state.turns.length - 1];
   return isTurnInProgressStatus(lastTurn?.status);
+}
+
+function playNotificationTone(
+  kind: "completion" | "userInput",
+  audioContextRef: React.MutableRefObject<AudioContext | null>,
+): void {
+  const AudioContextCtor = window.AudioContext;
+  if (!AudioContextCtor) {
+    return;
+  }
+
+  const context =
+    audioContextRef.current ?? new AudioContextCtor();
+  audioContextRef.current = context;
+
+  if (context.state === "suspended") {
+    void context.resume().catch(() => {});
+  }
+
+  const oscillator = context.createOscillator();
+  const gainNode = context.createGain();
+  oscillator.connect(gainNode);
+  gainNode.connect(context.destination);
+
+  const startTime = context.currentTime;
+  if (kind === "completion") {
+    oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(880, startTime);
+    oscillator.frequency.exponentialRampToValueAtTime(1174, startTime + 0.12);
+  } else {
+    oscillator.type = "triangle";
+    oscillator.frequency.setValueAtTime(740, startTime);
+    oscillator.frequency.exponentialRampToValueAtTime(988, startTime + 0.08);
+    oscillator.frequency.exponentialRampToValueAtTime(740, startTime + 0.18);
+  }
+
+  gainNode.gain.setValueAtTime(0.0001, startTime);
+  gainNode.gain.exponentialRampToValueAtTime(0.035, startTime + 0.02);
+  gainNode.gain.exponentialRampToValueAtTime(0.0001, startTime + 0.22);
+
+  oscillator.start(startTime);
+  oscillator.stop(startTime + 0.24);
 }
 
 function signaturesMatch(prev: string[], next: string[]): boolean {
@@ -1155,6 +1255,8 @@ export function App(): React.JSX.Element {
     initialHasSavedServerBaseUrl,
   );
   const [isSettingsModalOpen, setIsSettingsModalOpen] = useState(false);
+  const [notificationPreferences, setNotificationPreferences] =
+    useState<NotificationPreferences>(() => readNotificationPreferences());
 
   /* UI state */
   const [activeTab, setActiveTab] = useState<"chat" | "debug">(
@@ -1240,6 +1342,11 @@ export function App(): React.JSX.Element {
   const modelsSignatureRef = useRef<string[]>([]);
   const historyDetailCacheRef = useRef<Map<string, HistoryDetail>>(new Map());
   const historyDetailRequestIdRef = useRef(0);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const previousThreadNotificationStateRef = useRef<
+    Map<string, ThreadNotificationSnapshot>
+  >(new Map());
+  const hasHydratedThreadNotificationStateRef = useRef(false);
 
   /* Derived */
   const selectedThread = useMemo(
@@ -1807,7 +1914,14 @@ export function App(): React.JSX.Element {
       : Promise.resolve<HistoryResponse | null>(null);
 
     const nt = await sidebarPromise;
-    const incomingThreads = sortThreadsByRecency(nt.rows);
+    const incomingThreads = sortThreadsByRecency(
+      nt.rows.map((thread) =>
+        mergeThreadSummaryWithCachedState(
+          thread,
+          threadViewStateCacheRef.current.get(thread.id) ?? null,
+        ),
+      ),
+    );
     const optimisticSelectedThreadIds = optimisticSelectedThreadIdsRef.current;
     if (optimisticSelectedThreadIds.size > 0) {
       for (const thread of incomingThreads) {
@@ -2585,6 +2699,64 @@ export function App(): React.JSX.Element {
       window.removeEventListener("pageshow", onPageShow);
     };
   }, [selectedThreadId]);
+
+  useEffect(() => {
+    writeNotificationPreferences(notificationPreferences);
+  }, [notificationPreferences]);
+
+  useEffect(() => {
+    const nextSnapshot = new Map<string, ThreadNotificationSnapshot>(
+      threads.map((thread) => [
+        thread.id,
+        {
+          isGenerating: Boolean(thread.isGenerating),
+          waitingOnUserInput: Boolean(thread.waitingOnUserInput),
+        },
+      ]),
+    );
+
+    if (!hasHydratedThreadNotificationStateRef.current) {
+      previousThreadNotificationStateRef.current = nextSnapshot;
+      hasHydratedThreadNotificationStateRef.current = true;
+      return;
+    }
+
+    let shouldPlayCompletionSound = false;
+    let shouldPlayUserInputSound = false;
+
+    for (const [threadId, nextState] of nextSnapshot) {
+      const previousState =
+        previousThreadNotificationStateRef.current.get(threadId) ?? null;
+      if (!previousState) {
+        continue;
+      }
+
+      if (previousState.isGenerating && !nextState.isGenerating) {
+        shouldPlayCompletionSound = true;
+      }
+      if (
+        !previousState.waitingOnUserInput &&
+        nextState.waitingOnUserInput
+      ) {
+        shouldPlayUserInputSound = true;
+      }
+    }
+
+    previousThreadNotificationStateRef.current = nextSnapshot;
+
+    if (
+      shouldPlayCompletionSound &&
+      notificationPreferences.playCompletionSound
+    ) {
+      playNotificationTone("completion", audioContextRef);
+    }
+    if (
+      shouldPlayUserInputSound &&
+      notificationPreferences.playUserInputSound
+    ) {
+      playNotificationTone("userInput", audioContextRef);
+    }
+  }, [notificationPreferences, threads]);
 
   useEffect(() => {
     if (!selectedThreadId) {
@@ -4883,6 +5055,57 @@ export function App(): React.JSX.Element {
                     placeholder="Optional API key"
                     className="h-9 text-sm"
                   />
+                </div>
+
+                <div className="space-y-2 rounded-xl border border-border/70 bg-muted/20 p-3">
+                  <div className="space-y-1">
+                    <div className="text-sm font-medium">Sound alerts</div>
+                    <div className="text-xs text-muted-foreground">
+                      Play a short sound when any thread finishes or starts waiting for your answer.
+                    </div>
+                  </div>
+
+                  <label className="flex items-start gap-3 rounded-lg px-1 py-1.5 cursor-pointer">
+                    <Checkbox
+                      checked={notificationPreferences.playCompletionSound}
+                      onCheckedChange={(checked) => {
+                        setNotificationPreferences((current) => ({
+                          ...current,
+                          playCompletionSound: checked === true,
+                        }));
+                      }}
+                      className="mt-0.5"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm text-foreground">
+                        Thread finished
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Plays when a running chat stops generating.
+                      </span>
+                    </span>
+                  </label>
+
+                  <label className="flex items-start gap-3 rounded-lg px-1 py-1.5 cursor-pointer">
+                    <Checkbox
+                      checked={notificationPreferences.playUserInputSound}
+                      onCheckedChange={(checked) => {
+                        setNotificationPreferences((current) => ({
+                          ...current,
+                          playUserInputSound: checked === true,
+                        }));
+                      }}
+                      className="mt-0.5"
+                    />
+                    <span className="min-w-0">
+                      <span className="block text-sm text-foreground">
+                        Waiting for input
+                      </span>
+                      <span className="block text-xs text-muted-foreground">
+                        Plays when a chat asks you to choose or enter an answer.
+                      </span>
+                    </span>
+                  </label>
                 </div>
 
                 <div className="flex gap-2">
