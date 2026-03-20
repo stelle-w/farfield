@@ -48,12 +48,36 @@ const ServerBaseUrlSchema = z
     return url.toString().replace(/\/$/, "");
   });
 
-const StoredServerTargetSchema = z
+const ServerApiKeySchema = z.string().trim().max(4096).default("");
+
+const StoredServerTargetV1Schema = z
   .object({
     version: z.literal(1),
     baseUrl: ServerBaseUrlSchema,
   })
   .strict();
+
+const StoredServerTargetV2Schema = z
+  .object({
+    version: z.literal(2),
+    baseUrl: ServerBaseUrlSchema,
+    apiKey: ServerApiKeySchema,
+  })
+  .strict();
+
+const StoredServerTargetSchema = z
+  .union([StoredServerTargetV1Schema, StoredServerTargetV2Schema])
+  .transform((value) => {
+    if (value.version === 2) {
+      return value;
+    }
+
+    return {
+      version: 2 as const,
+      baseUrl: value.baseUrl,
+      apiKey: "",
+    };
+  });
 
 const StoredServerTargetTextSchema = z.string().transform((raw, ctx) => {
   try {
@@ -103,18 +127,27 @@ export function readStoredServerTarget(): StoredServerTarget | null {
   }
 
   const parsedJson = StoredServerTargetTextSchema.parse(raw);
-  return StoredServerTargetSchema.parse(parsedJson);
+  const parsed = StoredServerTargetSchema.parse(parsedJson);
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
+  return parsed;
 }
 
 export function parseServerBaseUrl(value: string): string {
   return ServerBaseUrlSchema.parse(value);
 }
 
-export function saveServerBaseUrl(value: string): StoredServerTarget {
-  const parsedBaseUrl = parseServerBaseUrl(value);
+export function normalizeServerApiKey(value: string): string {
+  return ServerApiKeySchema.parse(value);
+}
+
+export function saveServerTarget(input: {
+  baseUrl: string;
+  apiKey?: string;
+}): StoredServerTarget {
   const next: StoredServerTarget = {
-    version: 1,
-    baseUrl: parsedBaseUrl,
+    version: 2,
+    baseUrl: parseServerBaseUrl(input.baseUrl),
+    apiKey: normalizeServerApiKey(input.apiKey ?? ""),
   };
 
   if (typeof window !== "undefined") {
@@ -122,6 +155,22 @@ export function saveServerBaseUrl(value: string): StoredServerTarget {
   }
 
   return next;
+}
+
+export function saveServerBaseUrl(value: string): StoredServerTarget {
+  const current = readStoredServerTarget();
+  return saveServerTarget({
+    baseUrl: value,
+    apiKey: current?.apiKey ?? "",
+  });
+}
+
+export function saveServerApiKey(value: string): StoredServerTarget {
+  const current = readStoredServerTarget();
+  return saveServerTarget({
+    baseUrl: current?.baseUrl ?? getDefaultServerBaseUrl(),
+    apiKey: value,
+  });
 }
 
 export function clearStoredServerTarget(): void {
@@ -137,6 +186,11 @@ export function resolveServerBaseUrl(): string {
     return stored.baseUrl;
   }
   return getDefaultServerBaseUrl();
+}
+
+export function resolveServerApiKey(): string {
+  const stored = readStoredServerTarget();
+  return stored?.apiKey ?? "";
 }
 
 export function buildServerUrl(path: string, baseUrlOverride?: string): string {

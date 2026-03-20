@@ -30,10 +30,14 @@ import {
   buildServerUrl,
   clearStoredServerTarget,
   getDefaultServerBaseUrl as getDefaultStoredServerBaseUrl,
+  normalizeServerApiKey,
   parseServerBaseUrl,
   readStoredServerTarget,
+  resolveServerApiKey,
   resolveServerBaseUrl,
+  saveServerApiKey,
   saveServerBaseUrl,
+  saveServerTarget,
 } from "./server-target";
 
 const ApiEnvelopeSchema = z
@@ -369,6 +373,25 @@ export function setServerBaseUrl(value: string): string {
   return saveServerBaseUrl(value).baseUrl;
 }
 
+export function getServerApiKey(): string {
+  return resolveServerApiKey();
+}
+
+export function setServerApiKey(value: string): string {
+  return saveServerApiKey(value).apiKey;
+}
+
+export function saveServerConnectionSettings(input: {
+  baseUrl: string;
+  apiKey: string;
+}): { baseUrl: string; apiKey: string } {
+  const saved = saveServerTarget(input);
+  return {
+    baseUrl: saved.baseUrl,
+    apiKey: saved.apiKey,
+  };
+}
+
 export function clearServerBaseUrl(): void {
   clearStoredServerTarget();
 }
@@ -377,15 +400,36 @@ export function normalizeServerBaseUrl(value: string): string {
   return parseServerBaseUrl(value);
 }
 
+export function normalizeApiKey(value: string): string {
+  return normalizeServerApiKey(value);
+}
+
+function buildAuthHeaders(headers?: HeadersInit): Headers {
+  const next = new Headers(headers ?? {});
+  const apiKey = resolveServerApiKey();
+  if (apiKey.length > 0) {
+    next.set("Authorization", `Bearer ${apiKey}`);
+  }
+  return next;
+}
+
 export function getUnifiedEventsUrl(baseUrlOverride?: string): string {
-  return buildServerUrl("/api/unified/events", baseUrlOverride);
+  const url = new URL(buildServerUrl("/api/unified/events", baseUrlOverride));
+  const apiKey = resolveServerApiKey();
+  if (apiKey.length > 0) {
+    url.searchParams.set("access_token", apiKey);
+  }
+  return url.toString();
 }
 
 async function requestJson(
   path: string,
   init?: RequestInit,
 ): Promise<{ response: Response; payload: JsonValue }> {
-  const response = await fetch(buildServerUrl(path), init);
+  const response = await fetch(buildServerUrl(path), {
+    ...init,
+    headers: buildAuthHeaders(init?.headers),
+  });
   const payload = JsonValueSchema.parse(await response.json());
   return {
     response,
