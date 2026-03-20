@@ -10,6 +10,7 @@ import {
   type SendRequestOptions,
 } from "@farfield/api";
 import {
+  AppServerThreadListItemSchema,
   ProtocolValidationError,
   parseCommandExecutionRequestApprovalResponse,
   parseFileChangeRequestApprovalResponse,
@@ -356,6 +357,39 @@ export class CodexAgentAdapter implements AgentAdapter {
         ...waitingFlags,
       };
     });
+
+    const knownThreadIds = new Set(data.map((thread) => thread.id));
+    const loadedThreadIds = await this.listLoadedThreadIds();
+    const missingLoadedThreadIds = loadedThreadIds.filter(
+      (threadId) => !knownThreadIds.has(threadId),
+    );
+
+    logger.info(
+      {
+        listedCount: data.length,
+        loadedCount: loadedThreadIds.length,
+        missingLoadedCount: missingLoadedThreadIds.length,
+        archived: input.archived,
+        all: input.all,
+        limit: input.limit,
+      },
+      "codex-list-threads-summary",
+    );
+
+    if (missingLoadedThreadIds.length > 0) {
+      const loadedThreads = await Promise.all(
+        missingLoadedThreadIds.map(async (threadId) =>
+          this.buildListThreadItemFromReadThread(threadId),
+        ),
+      );
+      data.push(...loadedThreads);
+      logger.warn(
+        {
+          missingLoadedThreadIds,
+        },
+        "codex-list-threads-missing-loaded-threads",
+      );
+    }
 
     return {
       data,
@@ -1122,7 +1156,8 @@ export class CodexAgentAdapter implements AgentAdapter {
     );
   }
 
-  private async isThreadLoaded(threadId: string): Promise<boolean> {
+  private async listLoadedThreadIds(): Promise<string[]> {
+    const loadedThreadIds: string[] = [];
     let cursor: string | null = null;
 
     while (true) {
@@ -1132,16 +1167,40 @@ export class CodexAgentAdapter implements AgentAdapter {
           ...(cursor ? { cursor } : {}),
         }),
       );
-      if (response.data.some((loadedThreadId) => loadedThreadId === threadId)) {
-        return true;
-      }
+      loadedThreadIds.push(...response.data);
 
       const nextCursor = response.nextCursor ?? null;
       if (!nextCursor) {
-        return false;
+        return loadedThreadIds;
       }
       cursor = nextCursor;
     }
+  }
+
+  private async buildListThreadItemFromReadThread(
+    threadId: string,
+  ): Promise<AgentListThreadsResult["data"][number]> {
+    const response = await this.runAppServerCall(() =>
+      this.appClient.readThread(threadId, false),
+    );
+    const thread = response.thread;
+    const title = this.resolveThreadTitle(thread.id, thread.title);
+
+    return AppServerThreadListItemSchema.parse({
+      id: thread.id,
+      preview: thread["preview"],
+      title,
+      isGenerating: isThreadStateGenerating(thread),
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+      cwd: thread.cwd,
+      source: thread.source,
+    });
+  }
+
+  private async isThreadLoaded(threadId: string): Promise<boolean> {
+    const loadedThreadIds = await this.listLoadedThreadIds();
+    return loadedThreadIds.some((loadedThreadId) => loadedThreadId === threadId);
   }
 
   private async ensureThreadLoaded(threadId: string): Promise<void> {
