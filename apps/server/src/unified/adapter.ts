@@ -430,10 +430,24 @@ function createHandlerTable(
       }
 
       const liveState = await adapter.readLiveState(command.threadId);
+      if (command.knownStateVersion === liveState.stateVersion) {
+        return {
+          kind: "readLiveState",
+          threadId: command.threadId,
+          ownerClientId: liveState.ownerClientId,
+          stateVersion: liveState.stateVersion,
+          notModified: true,
+          conversationState: null,
+          ...(liveState.liveStateError
+            ? { liveStateError: liveState.liveStateError }
+            : {}),
+        };
+      }
       return {
         kind: "readLiveState",
         threadId: command.threadId,
         ownerClientId: liveState.ownerClientId,
+        stateVersion: liveState.stateVersion,
         conversationState: liveState.conversationState
           ? mapThread(provider, liveState.conversationState)
           : null,
@@ -456,10 +470,21 @@ function createHandlerTable(
         command.threadId,
         command.limit,
       );
+      if (command.knownEventsVersion === streamEvents.eventsVersion) {
+        return {
+          kind: "readStreamEvents",
+          threadId: command.threadId,
+          ownerClientId: streamEvents.ownerClientId,
+          eventsVersion: streamEvents.eventsVersion,
+          notModified: true,
+          events: [],
+        };
+      }
       return {
         kind: "readStreamEvents",
         threadId: command.threadId,
         ownerClientId: streamEvents.ownerClientId,
+        eventsVersion: streamEvents.eventsVersion,
         events: streamEvents.events.map((event) =>
           jsonValueFromString(JSON.stringify(event)),
         ),
@@ -550,7 +575,7 @@ function mapThreadSummary(
     createdAt: number;
     updatedAt: number;
     cwd?: string | undefined;
-    source?: string | undefined;
+    source?: string | number | boolean | object | null | undefined;
   },
 ): UnifiedThreadSummary {
   const waitingState = parseThreadWaitingState(thread.status);
@@ -558,6 +583,7 @@ function mapThreadSummary(
     thread.waitingOnApproval ?? waitingState?.waitingOnApproval;
   const waitingOnUserInput =
     thread.waitingOnUserInput ?? waitingState?.waitingOnUserInput;
+  const normalizedSource = normalizeThreadSource(thread.source);
   return {
     id: thread.id,
     provider,
@@ -571,7 +597,7 @@ function mapThreadSummary(
     ...(waitingOnApproval !== undefined ? { waitingOnApproval } : {}),
     ...(waitingOnUserInput !== undefined ? { waitingOnUserInput } : {}),
     ...(thread.cwd ? { cwd: thread.cwd } : {}),
-    ...(thread.source ? { source: thread.source } : {}),
+    ...(normalizedSource !== null ? { source: normalizedSource } : {}),
   };
 }
 
@@ -620,6 +646,7 @@ function mapThread(
   provider: UnifiedProviderId,
   thread: ThreadConversationState,
 ): UnifiedThread {
+  const normalizedSource = normalizeThreadSource(thread.source);
   return {
     id: thread.id,
     provider,
@@ -684,8 +711,27 @@ function mapThread(
         }
       : {}),
     ...(thread.cwd ? { cwd: thread.cwd } : {}),
-    ...(thread.source ? { source: thread.source } : {}),
+    ...(normalizedSource !== null ? { source: normalizedSource } : {}),
   };
+}
+
+function normalizeThreadSource(
+  source: string | number | boolean | object | null | undefined,
+): string | null {
+  if (typeof source === "string") {
+    return source;
+  }
+
+  if (
+    source &&
+    typeof source === "object" &&
+    !Array.isArray(source) &&
+    Object.prototype.hasOwnProperty.call(source, "subAgent")
+  ) {
+    return "subAgent";
+  }
+
+  return null;
 }
 
 function mapThreadRequest(
@@ -934,7 +980,11 @@ function mapTurnItem(
         ...(typeof item.willRetry === "boolean"
           ? { willRetry: item.willRetry }
           : {}),
-        ...(item.errorInfo !== undefined ? { errorInfo: item.errorInfo } : {}),
+        ...(item.errorInfo !== undefined
+          ? {
+              errorInfo: jsonValueFromString(JSON.stringify(item.errorInfo)),
+            }
+          : {}),
         ...(item.additionalDetails !== undefined
           ? {
               additionalDetails: jsonValueFromString(

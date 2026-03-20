@@ -98,6 +98,7 @@ export interface AgentInterruptInput {
 
 export interface AgentThreadLiveState {
   ownerClientId: string | null;
+  stateVersion: string;
   conversationState: AppServerReadThreadResponse["thread"] | null;
   liveStateError: {
     kind: "reductionFailed" | "parseFailed";
@@ -109,6 +110,7 @@ export interface AgentThreadLiveState {
 
 export interface AgentThreadStreamEvents {
   ownerClientId: string | null;
+  eventsVersion: string;
   events: IpcFrame[];
 }
 

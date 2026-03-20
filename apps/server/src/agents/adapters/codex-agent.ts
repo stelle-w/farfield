@@ -10,6 +10,7 @@ import {
   type SendRequestOptions,
 } from "@farfield/api";
 import {
+  AppServerThreadListItemSchema,
   ProtocolValidationError,
   parseCommandExecutionRequestApprovalResponse,
   parseFileChangeRequestApprovalResponse,
@@ -25,6 +26,7 @@ import {
   type ThreadStreamStateChangedBroadcast,
   type UserInputRequestId,
 } from "@farfield/protocol";
+import { createHash } from "node:crypto";
 import { logger } from "../../logger.js";
 import { resolveOwnerClientId } from "../../thread-owner.js";
 import type {
@@ -355,6 +357,39 @@ export class CodexAgentAdapter implements AgentAdapter {
         ...waitingFlags,
       };
     });
+
+    const knownThreadIds = new Set(data.map((thread) => thread.id));
+    const loadedThreadIds = await this.listLoadedThreadIds();
+    const missingLoadedThreadIds = loadedThreadIds.filter(
+      (threadId) => !knownThreadIds.has(threadId),
+    );
+
+    logger.info(
+      {
+        listedCount: data.length,
+        loadedCount: loadedThreadIds.length,
+        missingLoadedCount: missingLoadedThreadIds.length,
+        archived: input.archived,
+        all: input.all,
+        limit: input.limit,
+      },
+      "codex-list-threads-summary",
+    );
+
+    if (missingLoadedThreadIds.length > 0) {
+      const loadedThreads = await Promise.all(
+        missingLoadedThreadIds.map(async (threadId) =>
+          this.buildListThreadItemFromReadThread(threadId),
+        ),
+      );
+      data.push(...loadedThreads);
+      logger.warn(
+        {
+          missingLoadedThreadIds,
+        },
+        "codex-list-threads-missing-loaded-threads",
+      );
+    }
 
     return {
       data,
@@ -736,9 +771,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     const ownerClientId =
       this.threadOwnerById.get(threadId) ?? this.lastKnownOwnerClientId ?? null;
     const rawEvents = this.streamEventsByThreadId.get(threadId) ?? [];
+    const stateVersion = buildThreadStateVersion({
+      ownerClientId,
+      snapshotOrigin,
+      snapshotState,
+      rawEvents,
+    });
     if (rawEvents.length === 0) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -765,6 +807,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         );
         return {
           ownerClientId,
+          stateVersion,
           conversationState: snapshotState,
           liveStateError: {
             kind: "parseFailed",
@@ -779,6 +822,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (events.length === 0) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -796,6 +840,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (!hasReliableReductionBase) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -816,6 +861,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       const state = reduced.get(threadId);
       return {
         ownerClientId: state?.ownerClientId ?? ownerClientId ?? null,
+        stateVersion,
         conversationState: state?.conversationState ?? snapshotState,
         liveStateError: null,
       };
@@ -838,6 +884,7 @@ export class CodexAgentAdapter implements AgentAdapter {
 
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: {
           kind: "reductionFailed",
@@ -853,12 +900,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     threadId: string,
     limit: number,
   ): Promise<AgentThreadStreamEvents> {
+    const ownerClientId =
+      this.threadOwnerById.get(threadId) ?? this.lastKnownOwnerClientId ?? null;
+    const events = (this.streamEventsByThreadId.get(threadId) ?? []).slice(-limit);
     return {
-      ownerClientId:
-        this.threadOwnerById.get(threadId) ??
-        this.lastKnownOwnerClientId ??
-        null,
-      events: (this.streamEventsByThreadId.get(threadId) ?? []).slice(-limit),
+      ownerClientId,
+      eventsVersion: buildStreamEventsVersion({
+        ownerClientId,
+        events,
+      }),
+      events,
     };
   }
 
@@ -1105,7 +1156,8 @@ export class CodexAgentAdapter implements AgentAdapter {
     );
   }
 
-  private async isThreadLoaded(threadId: string): Promise<boolean> {
+  private async listLoadedThreadIds(): Promise<string[]> {
+    const loadedThreadIds: string[] = [];
     let cursor: string | null = null;
 
     while (true) {
@@ -1115,16 +1167,40 @@ export class CodexAgentAdapter implements AgentAdapter {
           ...(cursor ? { cursor } : {}),
         }),
       );
-      if (response.data.some((loadedThreadId) => loadedThreadId === threadId)) {
-        return true;
-      }
+      loadedThreadIds.push(...response.data);
 
       const nextCursor = response.nextCursor ?? null;
       if (!nextCursor) {
-        return false;
+        return loadedThreadIds;
       }
       cursor = nextCursor;
     }
+  }
+
+  private async buildListThreadItemFromReadThread(
+    threadId: string,
+  ): Promise<AgentListThreadsResult["data"][number]> {
+    const response = await this.runAppServerCall(() =>
+      this.appClient.readThread(threadId, false),
+    );
+    const thread = response.thread;
+    const title = this.resolveThreadTitle(thread.id, thread.title);
+
+    return AppServerThreadListItemSchema.parse({
+      id: thread.id,
+      preview: thread["preview"],
+      title,
+      isGenerating: isThreadStateGenerating(thread),
+      createdAt: thread.createdAt,
+      updatedAt: thread.updatedAt,
+      cwd: thread.cwd,
+      source: thread.source,
+    });
+  }
+
+  private async isThreadLoaded(threadId: string): Promise<boolean> {
+    const loadedThreadIds = await this.listLoadedThreadIds();
+    return loadedThreadIds.some((loadedThreadId) => loadedThreadId === threadId);
   }
 
   private async ensureThreadLoaded(threadId: string): Promise<void> {
@@ -1437,6 +1513,45 @@ function trimThreadStreamEventsForReduction(
     events: events.slice(latestSnapshotIndex),
     hasSnapshot: true,
   };
+}
+
+function buildThreadStateVersion(input: {
+  ownerClientId: string | null;
+  snapshotOrigin: StreamSnapshotOrigin | null;
+  snapshotState: ThreadConversationState | null;
+  rawEvents: IpcFrame[];
+}): string {
+  return createHash("sha1")
+    .update(
+      JSON.stringify({
+        ownerClientId: input.ownerClientId,
+        snapshotOrigin: input.snapshotOrigin,
+        snapshotUpdatedAt: input.snapshotState?.updatedAt ?? null,
+        snapshotTurnCount: input.snapshotState?.turns.length ?? 0,
+        snapshotRequestCount: input.snapshotState?.requests.length ?? 0,
+        rawEventCount: input.rawEvents.length,
+        lastRawEvent:
+          input.rawEvents.length > 0 ? input.rawEvents[input.rawEvents.length - 1] : null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function buildStreamEventsVersion(input: {
+  ownerClientId: string | null;
+  events: IpcFrame[];
+}): string {
+  return createHash("sha1")
+    .update(
+      JSON.stringify({
+        ownerClientId: input.ownerClientId,
+        count: input.events.length,
+        lastEvent: input.events.length > 0 ? input.events[input.events.length - 1] : null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
 }
 
 function extractThreadId(frame: IpcFrame): string | null {

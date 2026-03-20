@@ -115,7 +115,7 @@ export const ErrorItemSchema = z
     type: z.literal("error"),
     message: z.string(),
     willRetry: z.boolean().optional(),
-    errorInfo: z.union([z.string(), z.null()]).optional(),
+    errorInfo: z.union([JsonValueSchema, z.null()]).optional(),
     additionalDetails: z.union([JsonValueSchema, z.null()]).optional()
   })
   .passthrough();
@@ -325,6 +325,7 @@ export const CollabAgentStatusSchema = z.enum([
   "pendingInit",
   "running",
   "completed",
+  "interrupted",
   "errored",
   "shutdown",
   "notFound"
@@ -475,7 +476,7 @@ export const ThreadConversationStateSchema = z
     gitInfo: z.union([JsonValueSchema, z.null()]).optional(),
     resumeState: z.string().optional(),
     latestTokenUsageInfo: JsonValueSchema.optional(),
-    source: z.string().optional()
+    source: JsonValueSchema.optional()
   })
   .passthrough();
 
