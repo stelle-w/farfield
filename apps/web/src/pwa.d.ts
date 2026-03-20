@@ -7,3 +7,5 @@ declare module "virtual:pwa-register" {
     onRegisterError?: (error: Error) => void;
   }): (reloadPage?: boolean) => Promise<void>;
 }
+
+declare const __FARFIELD_DISABLE_RATE_LIMITS__: boolean;
