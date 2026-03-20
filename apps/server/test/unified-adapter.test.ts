@@ -42,6 +42,7 @@ const CODEx_CAPABILITIES: AgentCapabilities = {
   canSubmitUserInput: true,
   canReadLiveState: true,
   canReadStreamEvents: true,
+  canReadRateLimits: true,
 };
 
 const OPENCODE_CAPABILITIES: AgentCapabilities = {
@@ -51,6 +52,7 @@ const OPENCODE_CAPABILITIES: AgentCapabilities = {
   canSubmitUserInput: false,
   canReadLiveState: false,
   canReadStreamEvents: false,
+  canReadRateLimits: false,
 };
 
 function createCodexAdapter(): AgentAdapter {
@@ -126,6 +128,7 @@ function createCodexAdapter(): AgentAdapter {
     async readLiveState() {
       return {
         ownerClientId: "owner-1",
+        stateVersion: "live-v1",
         conversationState: SAMPLE_THREAD,
         liveStateError: null,
       };
@@ -133,6 +136,7 @@ function createCodexAdapter(): AgentAdapter {
     async readStreamEvents() {
       return {
         ownerClientId: "owner-1",
+        eventsVersion: "events-v1",
         events: [
           {
             type: "request",
@@ -614,5 +618,50 @@ describe("unified provider adapters", () => {
         ? remoteTaskItem.taskId
         : null,
     ).toBe("task-123");
+  });
+
+  it("returns compact live state payload when version matches", async () => {
+    const unified = new AgentUnifiedProviderAdapter("codex", createCodexAdapter());
+
+    const result = await unified.execute(
+      UnifiedCommandSchema.parse({
+        kind: "readLiveState",
+        provider: "codex",
+        threadId: SAMPLE_THREAD.id,
+        knownStateVersion: "live-v1",
+      }),
+    );
+
+    expect(result.kind).toBe("readLiveState");
+    if (result.kind !== "readLiveState") {
+      return;
+    }
+
+    expect(result.notModified).toBe(true);
+    expect(result.stateVersion).toBe("live-v1");
+    expect(result.conversationState).toBeNull();
+  });
+
+  it("returns compact stream events payload when version matches", async () => {
+    const unified = new AgentUnifiedProviderAdapter("codex", createCodexAdapter());
+
+    const result = await unified.execute(
+      UnifiedCommandSchema.parse({
+        kind: "readStreamEvents",
+        provider: "codex",
+        threadId: SAMPLE_THREAD.id,
+        limit: 20,
+        knownEventsVersion: "events-v1",
+      }),
+    );
+
+    expect(result.kind).toBe("readStreamEvents");
+    if (result.kind !== "readStreamEvents") {
+      return;
+    }
+
+    expect(result.notModified).toBe(true);
+    expect(result.eventsVersion).toBe("events-v1");
+    expect(result.events).toEqual([]);
   });
 });

@@ -518,7 +518,7 @@ const UnifiedErrorItemSchema = z
     type: z.literal("error"),
     message: z.string(),
     willRetry: z.boolean().optional(),
-    errorInfo: NullableStringSchema.optional(),
+    errorInfo: z.union([JsonValueSchema, z.null()]).optional(),
     additionalDetails: z.union([JsonValueSchema, z.null()]).optional()
   })
   .strict();
@@ -988,7 +988,8 @@ const UnifiedCommandReadLiveStateSchema = z
   .object({
     kind: z.literal("readLiveState"),
     provider: UnifiedProviderIdSchema,
-    threadId: NonEmptyStringSchema
+    threadId: NonEmptyStringSchema,
+    knownStateVersion: z.string().optional()
   })
   .strict();
 
@@ -997,7 +998,8 @@ const UnifiedCommandReadStreamEventsSchema = z
     kind: z.literal("readStreamEvents"),
     provider: UnifiedProviderIdSchema,
     threadId: NonEmptyStringSchema,
-    limit: z.number().int().positive().optional().default(80)
+    limit: z.number().int().positive().optional().default(80),
+    knownEventsVersion: z.string().optional()
   })
   .strict();
 
@@ -1112,6 +1114,8 @@ const UnifiedCommandResultReadLiveStateSchema = z
     kind: z.literal("readLiveState"),
     threadId: NonEmptyStringSchema,
     ownerClientId: z.union([z.string(), z.null()]),
+    stateVersion: z.string(),
+    notModified: z.boolean().optional(),
     conversationState: z.union([UnifiedThreadSchema, z.null()]),
     liveStateError: z
       .union([
@@ -1142,6 +1146,8 @@ const UnifiedCommandResultReadStreamEventsSchema = z
     kind: z.literal("readStreamEvents"),
     threadId: NonEmptyStringSchema,
     ownerClientId: z.union([z.string(), z.null()]),
+    eventsVersion: z.string(),
+    notModified: z.boolean().optional(),
     events: z.array(JsonValueSchema)
   })
   .strict();

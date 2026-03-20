@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { ProtocolValidationError } from "./errors.js";
 import { CollaborationModeSchema, ThreadConversationStateSchema } from "./thread.js";
+import { JsonValueSchema } from "./common.js";
 import {
   APP_SERVER_CLIENT_NOTIFICATION_METHODS,
   APP_SERVER_CLIENT_REQUEST_METHODS,
@@ -20,8 +21,23 @@ import {
   ThreadStartParamsSchema as GeneratedThreadStartParamsSchema
 } from "./generated/app-server/index.js";
 
-const AppServerThreadListResponseBaseSchema = GeneratedThreadListResponseSchema.passthrough();
-const AppServerThreadReadResponseBaseSchema = GeneratedThreadReadResponseSchema.passthrough();
+const AppServerThreadListResponseBaseSchema = GeneratedThreadListResponseSchema.extend({
+  data: z.array(
+    GeneratedThreadListResponseSchema.shape.data.element.extend({
+      source: JsonValueSchema.optional()
+    }).passthrough()
+  )
+}).passthrough();
+const AppServerThreadReadResponseBaseSchema: z.ZodObject<
+  {
+    thread: typeof ThreadConversationStateSchema;
+  },
+  "passthrough"
+> = z
+  .object({
+    thread: ThreadConversationStateSchema
+  })
+  .passthrough();
 const AppServerModelListResponseBaseSchema = GeneratedModelListResponseSchema.passthrough();
 const AppServerCollaborationModeListResponseBaseSchema =
   GeneratedCollaborationModeListResponseSchema.passthrough();

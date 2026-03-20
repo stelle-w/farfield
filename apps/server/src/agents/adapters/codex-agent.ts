@@ -25,6 +25,7 @@ import {
   type ThreadStreamStateChangedBroadcast,
   type UserInputRequestId,
 } from "@farfield/protocol";
+import { createHash } from "node:crypto";
 import { logger } from "../../logger.js";
 import { resolveOwnerClientId } from "../../thread-owner.js";
 import type {
@@ -736,9 +737,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     const ownerClientId =
       this.threadOwnerById.get(threadId) ?? this.lastKnownOwnerClientId ?? null;
     const rawEvents = this.streamEventsByThreadId.get(threadId) ?? [];
+    const stateVersion = buildThreadStateVersion({
+      ownerClientId,
+      snapshotOrigin,
+      snapshotState,
+      rawEvents,
+    });
     if (rawEvents.length === 0) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -765,6 +773,7 @@ export class CodexAgentAdapter implements AgentAdapter {
         );
         return {
           ownerClientId,
+          stateVersion,
           conversationState: snapshotState,
           liveStateError: {
             kind: "parseFailed",
@@ -779,6 +788,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (events.length === 0) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -796,6 +806,7 @@ export class CodexAgentAdapter implements AgentAdapter {
     if (!hasReliableReductionBase) {
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: null,
       };
@@ -816,6 +827,7 @@ export class CodexAgentAdapter implements AgentAdapter {
       const state = reduced.get(threadId);
       return {
         ownerClientId: state?.ownerClientId ?? ownerClientId ?? null,
+        stateVersion,
         conversationState: state?.conversationState ?? snapshotState,
         liveStateError: null,
       };
@@ -838,6 +850,7 @@ export class CodexAgentAdapter implements AgentAdapter {
 
       return {
         ownerClientId,
+        stateVersion,
         conversationState: snapshotState,
         liveStateError: {
           kind: "reductionFailed",
@@ -853,12 +866,16 @@ export class CodexAgentAdapter implements AgentAdapter {
     threadId: string,
     limit: number,
   ): Promise<AgentThreadStreamEvents> {
+    const ownerClientId =
+      this.threadOwnerById.get(threadId) ?? this.lastKnownOwnerClientId ?? null;
+    const events = (this.streamEventsByThreadId.get(threadId) ?? []).slice(-limit);
     return {
-      ownerClientId:
-        this.threadOwnerById.get(threadId) ??
-        this.lastKnownOwnerClientId ??
-        null,
-      events: (this.streamEventsByThreadId.get(threadId) ?? []).slice(-limit),
+      ownerClientId,
+      eventsVersion: buildStreamEventsVersion({
+        ownerClientId,
+        events,
+      }),
+      events,
     };
   }
 
@@ -1437,6 +1454,45 @@ function trimThreadStreamEventsForReduction(
     events: events.slice(latestSnapshotIndex),
     hasSnapshot: true,
   };
+}
+
+function buildThreadStateVersion(input: {
+  ownerClientId: string | null;
+  snapshotOrigin: StreamSnapshotOrigin | null;
+  snapshotState: ThreadConversationState | null;
+  rawEvents: IpcFrame[];
+}): string {
+  return createHash("sha1")
+    .update(
+      JSON.stringify({
+        ownerClientId: input.ownerClientId,
+        snapshotOrigin: input.snapshotOrigin,
+        snapshotUpdatedAt: input.snapshotState?.updatedAt ?? null,
+        snapshotTurnCount: input.snapshotState?.turns.length ?? 0,
+        snapshotRequestCount: input.snapshotState?.requests.length ?? 0,
+        rawEventCount: input.rawEvents.length,
+        lastRawEvent:
+          input.rawEvents.length > 0 ? input.rawEvents[input.rawEvents.length - 1] : null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
+}
+
+function buildStreamEventsVersion(input: {
+  ownerClientId: string | null;
+  events: IpcFrame[];
+}): string {
+  return createHash("sha1")
+    .update(
+      JSON.stringify({
+        ownerClientId: input.ownerClientId,
+        count: input.events.length,
+        lastEvent: input.events.length > 0 ? input.events[input.events.length - 1] : null,
+      }),
+      "utf8",
+    )
+    .digest("hex");
 }
 
 function extractThreadId(frame: IpcFrame): string | null {

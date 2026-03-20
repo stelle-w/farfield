@@ -125,6 +125,8 @@ const LiveStateResponseSchema = z
     ok: z.literal(true),
     threadId: z.string(),
     ownerClientId: z.string().nullable(),
+    stateVersion: z.string(),
+    notModified: z.boolean().optional(),
     conversationState: z.union([UnifiedThreadSchema, z.null()]),
     liveStateError: z
       .union([
@@ -155,6 +157,8 @@ const StreamEventsResponseSchema = z
     ok: z.literal(true),
     threadId: z.string(),
     ownerClientId: z.string().nullable(),
+    eventsVersion: z.string(),
+    notModified: z.boolean().optional(),
     events: z.array(JsonValueSchema),
   })
   .strict();
@@ -532,6 +536,24 @@ async function runUnifiedCommand(
   return commandResponse.result;
 }
 
+type UnifiedCommandResultByKind<K extends UnifiedCommand["kind"]> = Extract<
+  UnifiedCommandResult,
+  { kind: K }
+>;
+
+function expectUnifiedCommandResultKind<K extends UnifiedCommand["kind"]>(
+  result: UnifiedCommandResult,
+  kind: K,
+): UnifiedCommandResultByKind<K> {
+  if (result.kind !== kind) {
+    throw new Error(
+      `Unexpected unified command result: expected ${kind}, received ${result.kind}`,
+    );
+  }
+
+  return result as UnifiedCommandResultByKind<K>;
+}
+
 function isFeatureAvailable(
   availability: UnifiedFeatureAvailability | undefined,
 ): boolean {
@@ -794,21 +816,28 @@ export async function listModels(
 export async function getLiveState(
   threadId: string,
   provider: AgentId,
+  knownStateVersion?: string | null,
 ): Promise<z.infer<typeof LiveStateResponseSchema>> {
-  const result = await runUnifiedCommand({
-    kind: "readLiveState",
-    provider,
-    threadId,
-  });
-
-  if (result.kind !== "readLiveState") {
-    throw new Error(`Unexpected unified command result: ${result.kind}`);
-  }
+  const result = expectUnifiedCommandResultKind(
+    await runUnifiedCommand({
+      kind: "readLiveState",
+      provider,
+      threadId,
+      ...(typeof knownStateVersion === "string" && knownStateVersion.length > 0
+        ? { knownStateVersion }
+        : {}),
+    }),
+    "readLiveState",
+  );
 
   return LiveStateResponseSchema.parse({
     ok: true,
     threadId: result.threadId,
     ownerClientId: result.ownerClientId,
+    stateVersion: result.stateVersion,
+    ...(typeof result.notModified === "boolean"
+      ? { notModified: result.notModified }
+      : {}),
     conversationState: result.conversationState,
     liveStateError: result.liveStateError ?? null,
   });
@@ -817,22 +846,29 @@ export async function getLiveState(
 export async function getStreamEvents(
   threadId: string,
   provider: AgentId,
+  knownEventsVersion?: string | null,
 ): Promise<z.infer<typeof StreamEventsResponseSchema>> {
-  const result = await runUnifiedCommand({
-    kind: "readStreamEvents",
-    provider,
-    threadId,
-    limit: 80,
-  });
-
-  if (result.kind !== "readStreamEvents") {
-    throw new Error(`Unexpected unified command result: ${result.kind}`);
-  }
+  const result = expectUnifiedCommandResultKind(
+    await runUnifiedCommand({
+      kind: "readStreamEvents",
+      provider,
+      threadId,
+      limit: 80,
+      ...(typeof knownEventsVersion === "string" && knownEventsVersion.length > 0
+        ? { knownEventsVersion }
+        : {}),
+    }),
+    "readStreamEvents",
+  );
 
   return StreamEventsResponseSchema.parse({
     ok: true,
     threadId: result.threadId,
     ownerClientId: result.ownerClientId,
+    eventsVersion: result.eventsVersion,
+    ...(typeof result.notModified === "boolean"
+      ? { notModified: result.notModified }
+      : {}),
     events: result.events,
   });
 }

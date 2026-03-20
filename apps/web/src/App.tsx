@@ -185,7 +185,9 @@ interface LoadSelectedThreadOptions {
 interface CachedThreadViewState {
   readThreadState: ReadThreadResponse | null;
   liveState: LiveStateResponse | null;
+  liveStateVersion: string | null;
   streamEvents: StreamEventsResponse["events"];
+  streamEventsVersion: string | null;
 }
 
 interface AgentCacheEntry {
@@ -526,7 +528,11 @@ function canUseFeature(
 }
 
 function isTurnInProgressStatus(status: string | undefined): boolean {
-  return status === "in-progress" || status === "inProgress";
+  return (
+    status === "in-progress" ||
+    status === "inProgress" ||
+    status === "in_progress"
+  );
 }
 
 function isThreadGeneratingState(
@@ -1217,7 +1223,9 @@ export function App(): React.JSX.Element {
             {
               readThreadState: initialSnapshot.readThreadState,
               liveState: initialSnapshot.liveState,
+              liveStateVersion: null,
               streamEvents: initialSnapshot.streamEvents,
+              streamEventsVersion: null,
             },
           ],
         ])
@@ -2153,16 +2161,30 @@ export function App(): React.JSX.Element {
           provider: threadAgentId,
         });
       }
+      const existingCachedState =
+        threadViewStateCacheRef.current.get(threadId) ?? null;
 
-      const live = canReadLiveState
-        ? await getLiveState(threadId, threadAgentId)
+      const liveResponse = canReadLiveState
+        ? await getLiveState(
+            threadId,
+            threadAgentId,
+            existingCachedState?.liveStateVersion ?? null,
+          )
         : {
             ok: true as const,
             threadId,
             ownerClientId: null,
+            stateVersion: "",
+            notModified: false,
             conversationState: null,
             liveStateError: null,
           };
+      const live =
+        liveResponse.notModified === true && existingCachedState?.liveState
+          ? existingCachedState.liveState
+          : liveResponse;
+      const liveStateVersion =
+        liveResponse.stateVersion.length > 0 ? liveResponse.stateVersion : null;
 
       if (!shouldReadTurns && live.conversationState === null) {
         read = await readThread(threadId, {
@@ -2178,8 +2200,6 @@ export function App(): React.JSX.Element {
         (includeStreamEvents || threadAgentId === "codex");
       const shouldUpdateSelectedThread =
         selectedThreadIdRef.current === threadId;
-      const existingCachedState =
-        threadViewStateCacheRef.current.get(threadId) ?? null;
       let nextStreamEvents = existingCachedState?.streamEvents ?? [];
       startTransition(() => {
         setThreads((previousThreads) => {
@@ -2255,21 +2275,39 @@ export function App(): React.JSX.Element {
           ? read
           : (existingCachedState?.readThreadState ?? null),
         liveState: live,
+        liveStateVersion,
         streamEvents: nextStreamEvents,
+        streamEventsVersion: existingCachedState?.streamEventsVersion ?? null,
       });
 
       if (!shouldLoadStreamEvents) {
         return;
       }
 
-      const stream = await getStreamEvents(threadId, threadAgentId);
+      const streamResponse = await getStreamEvents(
+        threadId,
+        threadAgentId,
+        existingCachedState?.streamEventsVersion ?? null,
+      );
+      const stream =
+        streamResponse.notModified === true
+          ? {
+              ...streamResponse,
+              events: existingCachedState?.streamEvents ?? [],
+            }
+          : streamResponse;
       nextStreamEvents = stream.events;
       threadViewStateCacheRef.current.set(threadId, {
         readThreadState: shouldReadTurns
           ? read
           : (existingCachedState?.readThreadState ?? null),
         liveState: live,
+        liveStateVersion,
         streamEvents: nextStreamEvents,
+        streamEventsVersion:
+          streamResponse.eventsVersion.length > 0
+            ? streamResponse.eventsVersion
+            : (existingCachedState?.streamEventsVersion ?? null),
       });
       if (selectedThreadIdRef.current !== threadId) {
         return;

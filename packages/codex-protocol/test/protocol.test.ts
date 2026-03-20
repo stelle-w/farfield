@@ -1107,4 +1107,72 @@ describe("codex-protocol schemas", () => {
 
     expect(parsed.thread.id).toBe("sess-2");
   });
+
+  it("parses stream snapshot when error items have structured errorInfo", () => {
+    const parsed = parseThreadStreamStateChangedBroadcast({
+      type: "broadcast",
+      method: "thread-stream-state-changed",
+      sourceClientId: "client-123",
+      version: 4,
+      params: {
+        conversationId: "thread-123",
+        type: "thread-stream-state-changed",
+        version: 4,
+        change: {
+          type: "snapshot",
+          conversationState: {
+            id: "thread-123",
+            turns: [
+              {
+                status: "completed",
+                items: [
+                  {
+                    id: "err-1",
+                    type: "error",
+                    message: "Request failed",
+                    errorInfo: {
+                      responseStreamDisconnected: {
+                        httpStatusCode: 502,
+                      },
+                    },
+                    additionalDetails: null,
+                  },
+                ],
+              },
+            ],
+            requests: [],
+          },
+        },
+      },
+    });
+
+    expect(parsed.params.change.type).toBe("snapshot");
+  });
+
+  it("parses thread state when source is a structured sub-agent object", () => {
+    const parsed = parseAppServerReadThreadResponse({
+      thread: {
+        id: "thread-789",
+        preview: "hello",
+        modelProvider: "openai",
+        createdAt: 1700000000,
+        updatedAt: 1700000000,
+        cwd: "/tmp/workspace",
+        source: {
+          subAgent: {
+            parentThreadId: "thread-parent",
+            invocationId: "invoke-1",
+          },
+        },
+        status: {
+          type: "idle",
+        },
+        path: "/tmp/thread.jsonl",
+        cliVersion: "0.1.0",
+        turns: [],
+      },
+    });
+
+    expect(parsed.thread.id).toBe("thread-789");
+  });
 });

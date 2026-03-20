@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
+import { brotliCompressSync, gzipSync, constants as zlibConstants } from "node:zlib";
 import type { IpcFrame } from "@farfield/protocol";
 import {
   UnifiedCommandSchema,
@@ -145,16 +146,41 @@ function jsonResponse(
   res: ServerResponse,
   statusCode: number,
   body: unknown,
+  req?: IncomingMessage,
 ): void {
   const encoded = Buffer.from(JSON.stringify(body), "utf8");
-  res.writeHead(statusCode, {
+  const acceptEncodingHeader = req?.headers["accept-encoding"];
+  const acceptEncoding =
+    typeof acceptEncodingHeader === "string"
+      ? acceptEncodingHeader
+      : "";
+  const canBrotli = acceptEncoding.includes("br");
+  const canGzip = acceptEncoding.includes("gzip");
+  const shouldCompress = encoded.length >= 1024 && (canBrotli || canGzip);
+  const compressed = shouldCompress
+    ? canBrotli
+      ? brotliCompressSync(encoded, {
+          params: {
+            [zlibConstants.BROTLI_PARAM_QUALITY]: 4,
+          },
+        })
+      : gzipSync(encoded, {
+          level: 6,
+        })
+    : encoded;
+  const headers: Record<string, number | string> = {
     "Content-Type": "application/json; charset=utf-8",
-    "Content-Length": encoded.length,
+    "Content-Length": compressed.length,
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "content-type,authorization,x-api-key",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-  });
-  res.end(encoded);
+  };
+  if (shouldCompress) {
+    headers["Content-Encoding"] = canBrotli ? "br" : "gzip";
+    headers["Vary"] = "Accept-Encoding";
+  }
+  res.writeHead(statusCode, headers);
+  res.end(compressed);
 }
 
 function getRequestApiKey(req: IncomingMessage, url: URL): string {
@@ -577,7 +603,7 @@ const server = http.createServer(async (req, res) => {
       jsonResponse(res, 200, {
         ok: true,
         features,
-      });
+      }, req);
       return;
     }
 
@@ -592,7 +618,7 @@ const server = http.createServer(async (req, res) => {
             code: "providerDisabled",
             message: `Provider ${command.provider} is not available`,
           },
-        });
+        }, req);
         return;
       }
 
@@ -618,7 +644,7 @@ const server = http.createServer(async (req, res) => {
         jsonResponse(res, 200, {
           ok: true,
           result,
-        });
+        }, req);
       } catch (error) {
         if (error instanceof UnifiedBackendFeatureError) {
           jsonResponse(res, 200, {
@@ -632,7 +658,7 @@ const server = http.createServer(async (req, res) => {
                 reason: error.reason,
               },
             },
-          });
+          }, req);
           return;
         }
 
@@ -648,7 +674,7 @@ const server = http.createServer(async (req, res) => {
             code: "internalError",
             message,
           },
-        });
+        }, req);
       }
       return;
     }
@@ -739,7 +765,7 @@ const server = http.createServer(async (req, res) => {
         data,
         cursors,
         errors,
-      });
+      }, req);
       return;
     }
 
@@ -826,7 +852,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         rows,
         errors,
-      });
+      }, req);
       return;
     }
 
@@ -850,7 +876,7 @@ const server = http.createServer(async (req, res) => {
               provider: rawProvider,
             },
           },
-        });
+        }, req);
         return;
       }
       const includeTurns = parseBoolean(
@@ -873,7 +899,7 @@ const server = http.createServer(async (req, res) => {
                 providers: knownProviders,
               },
             },
-          });
+          }, req);
           return;
         }
 
@@ -886,7 +912,7 @@ const server = http.createServer(async (req, res) => {
               threadId,
             },
           },
-        });
+        }, req);
         return;
       }
 
@@ -901,7 +927,7 @@ const server = http.createServer(async (req, res) => {
               provider,
             },
           },
-        });
+        }, req);
         return;
       }
 
@@ -917,7 +943,7 @@ const server = http.createServer(async (req, res) => {
         jsonResponse(res, 200, {
           ok: true,
           thread: result.thread,
-        });
+        }, req);
       } catch (error) {
         const message = toErrorMessage(error);
         jsonResponse(res, 500, {
@@ -931,7 +957,7 @@ const server = http.createServer(async (req, res) => {
               includeTurns,
             },
           },
-        });
+        }, req);
       }
       return;
     }
