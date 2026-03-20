@@ -701,7 +701,15 @@ const UnifiedCollabAgentToolCallItemSchema = z
     agentsStates: z.record(
       z
         .object({
-          status: z.enum(["pendingInit", "running", "completed", "errored", "shutdown", "notFound"]),
+          status: z.enum([
+            "pendingInit",
+            "running",
+            "completed",
+            "interrupted",
+            "errored",
+            "shutdown",
+            "notFound"
+          ]),
           message: NullableStringSchema.optional()
         })
         .strict()

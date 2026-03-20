@@ -42,4 +42,31 @@ describe("unified surface unions", () => {
     expect(parsed.opencode).toEqual({});
     expect(UNIFIED_FEATURE_IDS.length).toBeGreaterThan(0);
   });
+
+  it("accepts interrupted collab agent statuses", () => {
+    const parsed = UnifiedItemSchema.parse({
+      id: "collab-1",
+      type: "collabAgentToolCall",
+      tool: "spawnAgent",
+      status: "completed",
+      senderThreadId: "thread-123",
+      receiverThreadIds: ["thread-456"],
+      prompt: "Investigate the issue",
+      agentsStates: {
+        "agent-1": {
+          status: "interrupted",
+          message: "Stopped by user"
+        }
+      }
+    });
+
+    expect(parsed).toMatchObject({
+      type: "collabAgentToolCall",
+      agentsStates: {
+        "agent-1": {
+          status: "interrupted"
+        }
+      }
+    });
+  });
 });

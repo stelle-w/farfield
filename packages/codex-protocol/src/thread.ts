@@ -325,6 +325,7 @@ export const CollabAgentStatusSchema = z.enum([
   "pendingInit",
   "running",
   "completed",
+  "interrupted",
   "errored",
   "shutdown",
   "notFound"

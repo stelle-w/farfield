@@ -226,6 +226,64 @@ describe("codex-protocol schemas", () => {
     expect(parsed.params.change.type).toBe("snapshot");
   });
 
+  it("parses collab agent state when status is interrupted", () => {
+    const parsed = parseThreadStreamStateChangedBroadcast({
+      type: "broadcast",
+      method: "thread-stream-state-changed",
+      sourceClientId: "client-123",
+      version: 4,
+      params: {
+        conversationId: "thread-123",
+        type: "thread-stream-state-changed",
+        version: 4,
+        change: {
+          type: "snapshot",
+          conversationState: {
+            id: "thread-123",
+            turns: [
+              {
+                status: "inProgress",
+                items: [
+                  {
+                    id: "collab-1",
+                    type: "collabAgentToolCall",
+                    tool: "spawnAgent",
+                    status: "completed",
+                    senderThreadId: "thread-123",
+                    receiverThreadIds: ["thread-456"],
+                    prompt: "Investigate the issue",
+                    agentsStates: {
+                      "agent-1": {
+                        status: "interrupted",
+                        message: "Stopped by user"
+                      }
+                    }
+                  }
+                ]
+              }
+            ],
+            requests: []
+          }
+        }
+      }
+    });
+
+    expect(parsed.params.change.type).toBe("snapshot");
+    if (parsed.params.change.type !== "snapshot") {
+      throw new Error("expected snapshot change");
+    }
+    const turn = parsed.params.change.conversationState.turns[0];
+    expect(turn?.items[0]).toMatchObject({
+      type: "collabAgentToolCall",
+      agentsStates: {
+        "agent-1": {
+          status: "interrupted",
+          message: "Stopped by user"
+        }
+      }
+    });
+  });
+
   it("parses snapshot broadcast when turn includes todo-list item", () => {
     const parsed = parseThreadStreamStateChangedBroadcast({
       type: "broadcast",
