@@ -39,6 +39,7 @@ import {
   saveServerBaseUrl,
   saveServerTarget,
 } from "./server-target";
+import { recordTrafficSample } from "./traffic-stats";
 
 const ApiEnvelopeSchema = z
   .object({
@@ -327,6 +328,8 @@ const PROVIDER_LABELS: Record<UnifiedProviderId, string> = {
   opencode: "OpenCode",
 };
 
+const BYTE_ENCODER = new TextEncoder();
+
 export type AgentId = UnifiedProviderId;
 
 class UnifiedCommandApiError extends Error {
@@ -430,11 +433,18 @@ async function requestJson(
   path: string,
   init?: RequestInit,
 ): Promise<{ response: Response; payload: JsonValue }> {
+  const requestBody =
+    typeof init?.body === "string" ? init.body : "";
   const response = await fetch(buildServerUrl(path), {
     ...init,
     headers: buildAuthHeaders(init?.headers),
   });
-  const payload = JsonValueSchema.parse(await response.json());
+  const responseText = await response.text();
+  const payload = JsonValueSchema.parse(JSON.parse(responseText));
+  recordTrafficSample({
+    requestBytes: BYTE_ENCODER.encode(requestBody).length,
+    responseBytes: BYTE_ENCODER.encode(responseText).length,
+  });
   return {
     response,
     payload,

@@ -1,6 +1,6 @@
 import { memo } from "react";
 import { AnimatePresence, motion } from "framer-motion";
-import { ArrowDown } from "lucide-react";
+import { ArrowDown, Loader2 } from "lucide-react";
 import type { UnifiedItem } from "@farfield/unified-surface";
 import { ConversationItem } from "@/components/ConversationItem";
 import { Button } from "@/components/ui/button";
@@ -18,6 +18,7 @@ export interface ChatTimelineEntry {
 interface ChatTimelineProps {
   selectedThreadId: string | null;
   turnsLength: number;
+  isLoadingThread: boolean;
   hasAnyAgent: boolean;
   hasHiddenChatItems: boolean;
   visibleConversationItems: ChatTimelineEntry[];
@@ -32,6 +33,7 @@ interface ChatTimelineProps {
 export const ChatTimeline = memo(function ChatTimeline({
   selectedThreadId,
   turnsLength,
+  isLoadingThread,
   hasAnyAgent,
   hasHiddenChatItems,
   visibleConversationItems,
@@ -63,7 +65,12 @@ export const ChatTimeline = memo(function ChatTimeline({
             transition={{ duration: 0.14, ease: "easeOut" }}
             className="max-w-3xl mx-auto px-4 pt-4 pb-6"
           >
-            {turnsLength === 0 ? (
+            {isLoadingThread ? (
+              <div className="flex min-h-[40vh] flex-col items-center justify-center gap-3 py-20 text-sm text-muted-foreground">
+                <Loader2 size={18} className="animate-spin text-muted-foreground/70" />
+                <div>Loading chat…</div>
+              </div>
+            ) : turnsLength === 0 ? (
               <div className="text-center py-20 text-sm text-muted-foreground">
                 {selectedThreadId
                   ? "No messages yet"

@@ -80,13 +80,20 @@ export function ChatComposer({
       await onInterrupt();
       return;
     }
-    if (!draft.trim() || !canSend || isBusy) {
+    const nextDraft = draft.trim();
+    if (!nextDraft || !canSend || isBusy) {
       return;
     }
 
-    await onSend(draft);
+    const previousDraft = draft;
     setDraft("");
     previousHeightRef.current = 0;
+    try {
+      await onSend(nextDraft);
+    } catch (error) {
+      setDraft(previousDraft);
+      throw error;
+    }
   }, [canSend, draft, isBusy, isGenerating, onInterrupt, onSend]);
 
   const disableSend = isGenerating

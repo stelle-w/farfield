@@ -16,6 +16,12 @@
       content="#09090b"
       media="(prefers-color-scheme: dark)"
     />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta
+      name="apple-mobile-web-app-status-bar-style"
+      content="black-translucent"
+    />
     <script>
       (() => {
         try {
@@ -29,8 +35,10 @@
           root.classList.toggle("dark", useDarkTheme);
           root.style.colorScheme = useDarkTheme ? "dark" : "light";
           root.style.backgroundColor = useDarkTheme ? "#09090b" : "#ffffff";
+          document.body.style.backgroundColor = useDarkTheme ? "#09090b" : "#ffffff";
         } catch {
           document.documentElement.style.backgroundColor = "#ffffff";
+          document.body.style.backgroundColor = "#ffffff";
         }
       })();
     </script>
